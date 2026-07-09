@@ -1,0 +1,38 @@
+{
+  "name": "threejs-object-sculptor",
+  "version": "0.1.1+codex.20260709041728",
+  "description": "Turn object reference images into quality-gated, action-ready procedural Three.js reconstruction plans and code.",
+  "author": {
+    "name": "Vinh Hien"
+  },
+  "license": "MIT",
+  "keywords": [
+    "threejs",
+    "procedural-3d",
+    "image-analysis",
+    "object-reconstruction",
+    "webgpu"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Three.js Object Sculptor",
+    "shortDescription": "Validate object photos and rebuild them as procedural Three.js models.",
+    "longDescription": "A Codex workflow for converting a single object reference image into a pre-assessed quality contract, structured sculpt spec, procedural geometry plan, material recipe, lighting notes, action-ready runtime hierarchy, and implementation strategy for Three.js or WebGPU scenes.",
+    "developerName": "Vinh Hien",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Image Analysis",
+      "Three.js",
+      "Procedural Modeling",
+      "Action-Ready Models",
+      "Quality Gates",
+      "Validation"
+    ],
+    "defaultPrompt": [
+      "Analyze this object photo for procedural Three.js reconstruction.",
+      "Build a Three.js sculpt spec from this reference image.",
+      "Validate whether this object can be rebuilt procedurally."
+    ],
+    "brandColor": "#16A34A"
+  }
+}
