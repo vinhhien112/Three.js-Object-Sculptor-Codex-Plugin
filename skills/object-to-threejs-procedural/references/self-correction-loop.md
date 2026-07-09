@@ -5,18 +5,19 @@ Use this reference when a model construction pass has just finished.
 ## Review Order
 
 1. Capture or collect a rendered screenshot for the current browser view.
-2. Compare rendered screenshot to reference image and user requirements.
-3. Compare rendered screenshot to current `ObjectSculptSpec`.
-4. Decide whether the mismatch is caused by the spec, the implementation, lighting/camera, missing evidence, or performance tradeoff.
-5. Choose exactly one action:
+2. Create a side-by-side reference/render sheet with `make_visual_comparison_sheet.py`.
+3. Inspect the sheet with Codex AI vision and score the relevant visual layers.
+4. Compare the rendered result to current `ObjectSculptSpec`.
+5. Decide whether the mismatch is caused by the spec, the implementation, lighting/camera, missing evidence, or performance tradeoff.
+6. Choose exactly one action:
    - `continue`
    - `refine-spec`
    - `refine-code`
    - `request-input`
    - `stop`
-6. Record the review and screenshot paths in `reviewHistory`.
+7. Record the screenshot paths, comparison image, overall score, layer scores, and AI critique in `reviewHistory`.
 
-For visual passes, `continue` requires a rendered screenshot. Without one, the review is not evidence-backed enough.
+For visual passes, `continue` requires a rendered screenshot, a comparison image, and an AI vision score at or above the configured threshold. Without them, the review is not evidence-backed enough. Pixel comparison code is never the acceptance authority.
 
 ## Root Cause Guide
 

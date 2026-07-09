@@ -47,7 +47,8 @@ These scripts live at the plugin root, not inside this skill folder. From this `
 - `../../scripts/sculpt_pass_orchestrator.py sync object-sculpt-spec.json --in-place` refreshes `sculptPipeline` from `reviewHistory`.
 - `../../scripts/generate_threejs_factory.py object-sculpt-spec.json --out src/createObjectModel.ts` creates a TypeScript Three.js factory for the current unlocked build pass only.
 - `../../scripts/generate_threejs_factory.py object-sculpt-spec.json --pass-id structural-pass --out src/createObjectModel.ts` creates a deeper pass only after earlier passes were reviewed with `action=continue`.
-- `../../scripts/append_sculpt_review.py object-sculpt-spec.json --pass-id <pass> --fidelity <0-1> --action <continue|refine-spec|refine-code|request-input|stop> --summary "..." --render-screenshot <path> --camera-view <view> --in-place` records each self-correction review plus screenshot evidence.
+- `../../scripts/make_visual_comparison_sheet.py --reference <image> --render <screenshot> --out <comparison.png> --json` creates the side-by-side evidence image that AI vision must inspect. It deliberately does not calculate similarity or approve a pass.
+- `../../scripts/append_sculpt_review.py object-sculpt-spec.json --pass-id <pass> --fidelity <0-1> --action <continue|refine-spec|refine-code|request-input|stop> --summary "..." --render-screenshot <path> --comparison-image <path> --ai-vision-score <0-1> --layer-scores-json '{"silhouetteProportion":0.8}' --ai-vision-notes "..." --camera-view <view> --in-place` records each self-correction review plus AI vision evidence.
 
 Prefer this loop for implementation tasks:
 
@@ -58,7 +59,7 @@ Prefer this loop for implementation tasks:
 5. Validate the spec with normal validation, then run `--strict-quality` before code generation.
 6. Generate a factory skeleton only after the strict quality gate passes or after explicitly documenting accepted fidelity limits.
 7. Hand-refine geometry, materials, animation anchors, and destruction anchors one pass at a time. Do not generate or implement a deeper pass until `sculpt_pass_orchestrator.py check` passes for that pass.
-8. After each visual pass, capture a browser screenshot, compare it to the reference, run the self-correction gate, and update `reviewHistory`.
+8. After each visual pass, capture a browser screenshot, create a side-by-side comparison sheet, inspect that sheet with AI vision, then update `reviewHistory` with the overall score, layer scores, and mismatch critique.
 9. Run project typecheck/build and browser visual review; use the Codex in-app Browser screenshot tool first. Do not install or download Playwright/Chromium just for this skill unless the user explicitly requests that route.
 
 ## 3D Terminology Discipline
@@ -251,8 +252,18 @@ evidence:
 visualEvidence:
   referenceScreenshot:
   renderScreenshot:
+  comparisonImage:
   cameraView:
   notes:
+  aiVisionNotes:
+aiVisionScore: 0..1
+visualAcceptanceThreshold: 0..1
+layerScores:
+  silhouetteProportion: 0..1
+  componentStructure: 0..1
+  formDetail: 0..1
+  materialSurface: 0..1
+  lightingCamera: 0..1
 ```
 
 Decision rules:
@@ -269,7 +280,7 @@ Record review entries with `../../scripts/append_sculpt_review.py` whenever ther
 
 ### Screenshot Feedback Gate
 
-For browser-renderable construction, screenshots are mandatory feedback, not optional decoration. Codex should not decide that a visual pass is good enough from code inspection alone.
+For browser-renderable construction, screenshots are mandatory feedback, not optional decoration. Codex should not decide that a visual pass is good enough from code inspection alone. Code must not be the final image-comparison authority: the final pass decision comes from AI vision inspecting a side-by-side reference/render sheet.
 
 Use `references/browser-screenshot-feedback.md` for the detailed screenshot comparison checklist.
 Use `references/material-lighting-realism.md` when the shape is acceptable but material, color, texture, or lighting fidelity is still weak.
@@ -279,16 +290,17 @@ Use this order:
 
 1. Render the current model in the browser or project preview.
 2. Capture a screenshot at the relevant review viewpoint from `qualityTargets.reviewViewpoints`.
-3. Compare screenshot vs. source reference and user requirements by layer:
+3. Create the comparison artifact with `../../scripts/make_visual_comparison_sheet.py --reference <image> --render <screenshot> --out <comparison.png>`.
+4. Inspect the comparison image with Codex AI vision and score it by layer:
    - silhouette/proportion
    - component placement and hierarchy
    - local geometry features
    - material albedo, roughness, metalness, normal/bump/displacement
    - lighting, shadows, exposure, and camera angle
-4. Classify each mismatch as a spec gap, code gap, rendering/lighting gap, reference ambiguity, or performance tradeoff.
-5. Record the screenshot pair in `reviewHistory.visualEvidence` and `visualEvidence`.
+5. Classify each mismatch as a spec gap, code gap, rendering/lighting gap, reference ambiguity, or performance tradeoff.
+6. Record the screenshot pair, comparison image, overall AI vision score, layer scores, and critique in `reviewHistory.visualEvidence` and `visualEvidence`.
 
-Default to the Codex in-app Browser screenshot tool when available. Playwright/Chromium is not the default validation path for this skill; do not install or download a browser runtime merely to get screenshots unless the user explicitly asks for that route. If no screenshot can be captured for a visual pass, do not choose `continue`; choose `refine-code`, `request-input`, or explain the blocker.
+Default to the Codex in-app Browser screenshot tool when available. Playwright/Chromium is not the default validation path for this skill; do not install or download a browser runtime merely to get screenshots unless the user explicitly asks for that route. If no screenshot can be captured, no comparison sheet exists, AI vision has not reviewed it, or the score is below `selfCorrectLoop.visualAcceptance.threshold`, do not choose `continue`; choose `refine-spec`, `refine-code`, `request-input`, or explain the blocker.
 
 Minimum gates:
 
@@ -310,8 +322,10 @@ Before each implementation pass:
 2. Run `../../scripts/sculpt_pass_orchestrator.py check object-sculpt-spec.json --pass-id <pass>`.
 3. Generate or edit only the unlocked pass.
 4. Render in the Codex in-app Browser and capture screenshot evidence.
-5. Append review with `../../scripts/append_sculpt_review.py ... --pass-id <pass> --action continue --render-screenshot <path> --camera-view <view> --in-place`.
-6. Run `../../scripts/sculpt_pass_orchestrator.py sync object-sculpt-spec.json --in-place` when review history was edited manually.
+5. Build a side-by-side evidence image with `../../scripts/make_visual_comparison_sheet.py`.
+6. Inspect it with AI vision and record overall/layer scores plus concrete mismatch notes.
+7. Append review with `../../scripts/append_sculpt_review.py ... --pass-id <pass> --action continue --render-screenshot <path> --comparison-image <path> --ai-vision-score <0-1> --layer-scores-json '<json>' --ai-vision-notes "..." --camera-view <view> --in-place`.
+8. Run `../../scripts/sculpt_pass_orchestrator.py sync object-sculpt-spec.json --in-place` when review history was edited manually.
 
 The default generator is pass-gated. Calling `generate_threejs_factory.py` without `--pass-id` uses `sculptPipeline.currentPass`. Calling it with a future `--pass-id` must fail until prior passes are completed. This is intentional: first sculpt the blockout, then structure, then form, then material and surface detail.
 

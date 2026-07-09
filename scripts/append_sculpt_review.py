@@ -60,6 +60,26 @@ def validate_optional_file(value: str | None, label: str) -> None:
         raise FileNotFoundError(f"{label} does not exist: {value}")
 
 
+def visual_acceptance_threshold(spec: dict) -> float:
+    loop = spec.get("selfCorrectLoop")
+    if isinstance(loop, dict):
+        acceptance = loop.get("visualAcceptance")
+        if isinstance(acceptance, dict) and isinstance(acceptance.get("threshold"), (int, float)):
+            return clamp_score(float(acceptance["threshold"]))
+    targets = spec.get("qualityTargets")
+    if isinstance(targets, dict) and isinstance(targets.get("targetFidelity"), (int, float)):
+        return clamp_score(float(targets["targetFidelity"]))
+    return 0.7
+
+
+def visual_acceptance_config(spec: dict) -> dict:
+    loop = spec.get("selfCorrectLoop")
+    if not isinstance(loop, dict):
+        return {}
+    acceptance = loop.get("visualAcceptance")
+    return acceptance if isinstance(acceptance, dict) else {}
+
+
 def pass_order(spec: dict) -> list[str]:
     ids: list[str] = []
     for item in spec.get("buildPasses", []):
@@ -109,6 +129,15 @@ def review_completes_pass(entry: dict, pass_id: str) -> bool:
     visual = entry.get("visualEvidence")
     if pass_id in VISUAL_PASS_IDS and not (isinstance(visual, dict) and visual.get("renderScreenshot")):
         return False
+    if pass_id in VISUAL_PASS_IDS:
+        score = entry.get("aiVisionScore")
+        threshold = entry.get("visualAcceptanceThreshold", 0.7)
+        if not isinstance(score, (int, float)) or not isinstance(threshold, (int, float)):
+            return False
+        if float(score) < float(threshold):
+            return False
+        if not (isinstance(visual, dict) and visual.get("comparisonImage")):
+            return False
     return True
 
 
@@ -163,6 +192,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--evidence", help="Semicolon-separated screenshot/image/render paths or notes")
     parser.add_argument("--reference-screenshot", help="Reference image/screenshot path or URL used for visual comparison")
     parser.add_argument("--render-screenshot", help="Rendered browser screenshot path or URL for this pass")
+    parser.add_argument("--comparison-image", help="Side-by-side reference/render contact sheet reviewed by AI vision")
+    parser.add_argument("--ai-vision-score", type=float, help="AI vision visual match score from 0 to 1")
+    parser.add_argument("--layer-scores-json", help="JSON object with AI vision layer scores, e.g. silhouette/material/lighting")
+    parser.add_argument("--ai-vision-notes", help="AI vision critique explaining the score and mismatch root causes")
+    parser.add_argument("--visual-threshold", type=float, help="Override visual acceptance threshold for this review")
     parser.add_argument("--camera-view", help="Camera/viewpoint label, e.g. front, three-quarter, side, close-up")
     parser.add_argument("--visual-notes", help="Short notes from screenshot comparison")
     parser.add_argument(
@@ -177,6 +211,7 @@ def main(argv: list[str]) -> int:
     if args.require_screenshot_files:
         validate_optional_file(args.reference_screenshot, "--reference-screenshot")
         validate_optional_file(args.render_screenshot, "--render-screenshot")
+        validate_optional_file(args.comparison_image, "--comparison-image")
     if args.pass_id in VISUAL_PASS_IDS and args.action == "continue" and not args.render_screenshot:
         raise ValueError(
             "visual pass cannot use action=continue without --render-screenshot; "
@@ -188,11 +223,60 @@ def main(argv: list[str]) -> int:
     history = spec.setdefault("reviewHistory", [])
     if not isinstance(history, list):
         raise ValueError("reviewHistory must be an array")
+    threshold = clamp_score(args.visual_threshold) if args.visual_threshold is not None else visual_acceptance_threshold(spec)
+    layer_scores = None
+    if args.layer_scores_json:
+        layer_scores = json.loads(args.layer_scores_json)
+        if not isinstance(layer_scores, dict):
+            raise ValueError("--layer-scores-json must be a JSON object")
+        for key, value in layer_scores.items():
+            if not isinstance(key, str) or not isinstance(value, (int, float)):
+                raise ValueError("--layer-scores-json values must be numeric scores")
+            if not 0 <= float(value) <= 1:
+                raise ValueError("--layer-scores-json values must be from 0 to 1")
+    if args.ai_vision_score is not None and not 0 <= args.ai_vision_score <= 1:
+        raise ValueError("--ai-vision-score must be from 0 to 1")
+    if args.visual_threshold is not None and not 0 <= args.visual_threshold <= 1:
+        raise ValueError("--visual-threshold must be from 0 to 1")
+    if args.pass_id in VISUAL_PASS_IDS and args.action == "continue":
+        if not args.comparison_image:
+            raise ValueError(
+                "visual pass cannot use action=continue without --comparison-image; "
+                "create one with make_visual_comparison_sheet.py"
+            )
+        if args.ai_vision_score is None:
+            raise ValueError(
+                "visual pass cannot use action=continue without --ai-vision-score; "
+                "AI vision must review the comparison sheet"
+            )
+        if clamp_score(args.ai_vision_score) < threshold:
+            raise ValueError(
+                f"AI vision score {clamp_score(args.ai_vision_score):.3f} is below threshold "
+                f"{threshold:.3f}; choose refine-spec/refine-code/request-input instead of continue"
+            )
+        acceptance = visual_acceptance_config(spec)
+        if acceptance.get("layerScoresRequired") is True and not layer_scores:
+            raise ValueError("visual pass cannot use action=continue without --layer-scores-json")
+        required_layers = acceptance.get("requiredLayerScores", [])
+        if isinstance(required_layers, list) and layer_scores:
+            missing_layers = [
+                layer
+                for layer in required_layers
+                if isinstance(layer, str) and layer not in layer_scores
+            ]
+            if missing_layers:
+                raise ValueError(
+                    "--layer-scores-json is missing required layers: "
+                    + ", ".join(missing_layers)
+                )
 
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "passId": args.pass_id,
         "estimatedFidelity": clamp_score(args.fidelity),
+        "aiVisionScore": clamp_score(args.ai_vision_score) if args.ai_vision_score is not None else None,
+        "visualAcceptanceThreshold": threshold,
+        "layerScores": layer_scores or {},
         "action": args.action,
         "summary": args.summary,
         "matched": split_items(args.matched),
@@ -203,14 +287,23 @@ def main(argv: list[str]) -> int:
     }
 
     has_visual_evidence = any(
-        [args.reference_screenshot, args.render_screenshot, args.camera_view, args.visual_notes]
+        [
+            args.reference_screenshot,
+            args.render_screenshot,
+            args.comparison_image,
+            args.camera_view,
+            args.visual_notes,
+            args.ai_vision_notes,
+        ]
     )
     if has_visual_evidence:
         visual_evidence = {
             "referenceScreenshot": args.reference_screenshot or spec.get("sourceImage", ""),
             "renderScreenshot": args.render_screenshot or "",
+            "comparisonImage": args.comparison_image or "",
             "cameraView": args.camera_view or "",
             "notes": args.visual_notes or "",
+            "aiVisionNotes": args.ai_vision_notes or "",
         }
         entry["visualEvidence"] = visual_evidence
 
@@ -222,6 +315,9 @@ def main(argv: list[str]) -> int:
                 "timestamp": entry["timestamp"],
                 "passId": args.pass_id,
                 "estimatedFidelity": entry["estimatedFidelity"],
+                "aiVisionScore": entry["aiVisionScore"],
+                "visualAcceptanceThreshold": entry["visualAcceptanceThreshold"],
+                "layerScores": entry["layerScores"],
                 **visual_evidence,
             }
         )

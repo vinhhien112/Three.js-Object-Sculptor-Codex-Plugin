@@ -83,8 +83,14 @@ def visual_evidence(entry: dict[str, Any]) -> dict[str, Any]:
 def review_completes_pass(entry: dict[str, Any], pass_id: str) -> bool:
     if entry.get("passId") != pass_id or entry.get("action") != "continue":
         return False
-    if pass_id in VISUAL_PASS_IDS and not visual_evidence(entry).get("renderScreenshot"):
-        return False
+    if pass_id in VISUAL_PASS_IDS:
+        visual = visual_evidence(entry)
+        if not visual.get("renderScreenshot") or not visual.get("comparisonImage"):
+            return False
+        score = entry.get("aiVisionScore")
+        threshold = entry.get("visualAcceptanceThreshold", 0.7)
+        if not has_number(score) or not has_number(threshold) or float(score) < float(threshold):
+            return False
     return True
 
 
@@ -114,6 +120,8 @@ def next_required_evidence(spec: dict[str, Any], pass_id: str) -> list[str]:
     evidence.extend(pass_specific_evidence(pass_id))
     if pass_id in VISUAL_PASS_IDS:
         evidence.append("browser render screenshot from the Codex in-app Browser")
+        evidence.append("side-by-side reference/render comparison sheet for AI vision review")
+        evidence.append("AI vision score at or above the visual acceptance threshold")
         evidence.append("self-correction review appended with action=continue before the next pass")
     return evidence
 
@@ -378,6 +386,7 @@ def pass_specific_evidence(pass_id: str) -> list[str]:
             "macro, meso, and micro surface-frequency response at 1024px or higher",
             "local material masks: AO, dirt, wear, stains, moss, chips, scratches, wetness, or equivalent",
             "neutral, grazing-light close-up, and reference-matched browser screenshots",
+            "AI vision comparison sheet score meeting the visual acceptance threshold",
         ]
     if pass_id == "surface-pass":
         return [

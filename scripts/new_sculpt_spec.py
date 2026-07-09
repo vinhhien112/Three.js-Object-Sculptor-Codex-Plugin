@@ -260,6 +260,21 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
         },
         "selfCorrectLoop": {
             "enabled": True,
+            "visualAcceptance": {
+                "reviewer": "ai-vision",
+                "threshold": 0.7,
+                "comparisonArtifactRequired": True,
+                "layerScoresRequired": True,
+                "codePixelDiffIsAcceptanceAuthority": False,
+                "scoringRule": "AI vision must inspect a side-by-side reference/render sheet and score the current pass from 0 to 1. Pixel-diff code may assist diagnostics but cannot approve a pass.",
+                "requiredLayerScores": [
+                    "silhouetteProportion",
+                    "componentStructure",
+                    "formDetail",
+                    "materialSurface",
+                    "lightingCamera",
+                ],
+            },
             "reviewAfterPasses": [
                 "blockout",
                 "structural-pass",
@@ -307,8 +322,9 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                 ],
                 "preferredCapture": "in-app-browser-screenshot",
                 "fallbackCapture": "user-supplied-screenshot-path",
-                "minimumEvidence": "Each visual pass needs a reference image/screenshot and a rendered screenshot before choosing continue.",
+                "minimumEvidence": "Each visual pass needs a reference image, rendered screenshot, side-by-side comparison sheet, AI vision score, layer scores, and critique before choosing continue.",
                 "reviewPairRule": "Compare the same camera/viewpoint whenever possible; do not judge a front reference against a random render angle.",
+                "acceptanceAuthority": "AI vision review of the comparison sheet. Code-generated pixel similarity is not sufficient evidence.",
             },
         },
         "sculptPipeline": {
@@ -329,6 +345,8 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
             "blockedReason": "blockout requires a browser screenshot and self-correction review before structural-pass unlocks",
             "nextRequiredEvidence": [
                 "blockout browser render screenshot from the Codex in-app Browser",
+                "side-by-side reference/render comparison sheet",
+                "AI vision score >= 0.7 with layer scores and mismatch critique",
                 "reviewHistory entry for blockout with action=continue",
             ],
         },
@@ -658,6 +676,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                 "acceptance": [
                     "Silhouette reads correctly without materials.",
                     "Quality contract has named all required macro feature groups before code generation.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {
@@ -668,6 +687,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                     "Macro, meso, and repeated structures meet qualityContract.minimumSpecDepth.",
                     "Parent-child relations, joints, seams, sockets, and contact points are explicit.",
                     "Every attached child appendage/connector has parentSocket, localStart/localEnd, contactType, embedDepth or overlap, and gapTolerance.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {
@@ -677,6 +697,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                 "acceptance": [
                     "Important visible forms are represented in component geometryDescriptor, deformations, localFeatures, or repetitionSystems.",
                     "Endpoint-based child parts are rooted at their attachment sockets and do not visibly float away from parents.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {
@@ -692,6 +713,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                     "Generated preview uses independent PBR maps at 1024px or higher for the quality-first tier.",
                     "If source pixels are available, referencePbr extraction passed at confidence >= 0.7 or the pass is stopped/requesting better references.",
                     "Macro, meso, and micro surface frequency bands are visible at the intended review distance without obvious tiling.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {
@@ -701,6 +723,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                 "acceptance": [
                     "Every required material feature group has local overrides or surfaceDetail tied to evidenceRefs.",
                     "A grazing-angle close-up proves that normal/height detail breaks highlights naturally and does not read as smooth plastic.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {
@@ -712,6 +735,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                     "Exposure, tone mapping, background color/gradient, shadow softness, and contact shadow behavior are specified.",
                     "Lighting does not hide geometry/material gaps and screenshots can be compared fairly to the reference.",
                     "Neutral, grazing, and reference-matched lighting checks distinguish material errors from lighting errors.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {
@@ -721,6 +745,7 @@ def make_spec(target_name: str, image: str | None, assessment_payload: dict | No
                 "acceptance": [
                     "Macro and movable meso components have stable pivot nodes.",
                     "Sockets, collider proxies, and destruction metadata are present for future runtime actions.",
+                    "AI vision comparison score meets selfCorrectLoop.visualAcceptance.threshold.",
                 ],
             },
             {

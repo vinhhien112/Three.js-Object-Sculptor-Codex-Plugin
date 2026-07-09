@@ -847,6 +847,36 @@ def validate_self_correct_loop(spec: dict[str, Any], errors: list[str], warnings
         for action in actions:
             if action not in VALID_REVIEW_ACTIONS:
                 errors.append(f"selfCorrectLoop.allowedActions contains invalid action {action!r}")
+    visual_acceptance = loop.get("visualAcceptance")
+    if visual_acceptance is None:
+        warnings.append("quality: selfCorrectLoop.visualAcceptance is missing; AI vision cannot enforce visual fidelity")
+    elif not isinstance(visual_acceptance, dict):
+        errors.append("selfCorrectLoop.visualAcceptance must be an object")
+    else:
+        reviewer = visual_acceptance.get("reviewer")
+        if reviewer is not None and not isinstance(reviewer, str):
+            errors.append("selfCorrectLoop.visualAcceptance.reviewer must be a string")
+        threshold = visual_acceptance.get("threshold")
+        if threshold is None:
+            warnings.append("quality: selfCorrectLoop.visualAcceptance.threshold is missing")
+        else:
+            validate_unit_interval(threshold, "selfCorrectLoop.visualAcceptance.threshold", errors)
+        for field in (
+            "comparisonArtifactRequired",
+            "layerScoresRequired",
+            "codePixelDiffIsAcceptanceAuthority",
+        ):
+            value = visual_acceptance.get(field)
+            if value is not None and not isinstance(value, bool):
+                errors.append(f"selfCorrectLoop.visualAcceptance.{field} must be boolean")
+        scoring_rule = visual_acceptance.get("scoringRule")
+        if scoring_rule is not None and not isinstance(scoring_rule, str):
+            errors.append("selfCorrectLoop.visualAcceptance.scoringRule must be a string")
+        validate_string_array(
+            visual_acceptance.get("requiredLayerScores"),
+            "selfCorrectLoop.visualAcceptance.requiredLayerScores",
+            errors,
+        )
     policy = loop.get("screenshotPolicy")
     if policy is None:
         warnings.append("selfCorrectLoop.screenshotPolicy is missing; visual review may drift without screenshots")
@@ -854,7 +884,13 @@ def validate_self_correct_loop(spec: dict[str, Any], errors: list[str], warnings
         errors.append("selfCorrectLoop.screenshotPolicy must be an object")
     else:
         validate_string_array(policy.get("requiredForPasses"), "selfCorrectLoop.screenshotPolicy.requiredForPasses", errors)
-        for field in ("preferredCapture", "fallbackCapture", "minimumEvidence", "reviewPairRule"):
+        for field in (
+            "preferredCapture",
+            "fallbackCapture",
+            "minimumEvidence",
+            "reviewPairRule",
+            "acceptanceAuthority",
+        ):
             value = policy.get(field)
             if value is not None and not isinstance(value, str):
                 errors.append(f"selfCorrectLoop.screenshotPolicy.{field} must be a string")
@@ -864,13 +900,37 @@ def validate_visual_evidence_item(item: Any, label: str, errors: list[str]) -> N
     if not isinstance(item, dict):
         errors.append(f"{label} must be an object")
         return
-    for field in ("passId", "referenceScreenshot", "renderScreenshot", "cameraView", "notes"):
+    for field in (
+        "passId",
+        "referenceScreenshot",
+        "renderScreenshot",
+        "comparisonImage",
+        "cameraView",
+        "notes",
+        "aiVisionNotes",
+    ):
         value = item.get(field)
         if value is not None and not isinstance(value, str):
             errors.append(f"{label}.{field} must be a string")
     fidelity = item.get("estimatedFidelity")
     if fidelity is not None:
         validate_unit_interval(fidelity, f"{label}.estimatedFidelity", errors)
+    score = item.get("aiVisionScore")
+    if score is not None:
+        validate_unit_interval(score, f"{label}.aiVisionScore", errors)
+    threshold = item.get("visualAcceptanceThreshold")
+    if threshold is not None:
+        validate_unit_interval(threshold, f"{label}.visualAcceptanceThreshold", errors)
+    layer_scores = item.get("layerScores")
+    if layer_scores is not None:
+        if not isinstance(layer_scores, dict):
+            errors.append(f"{label}.layerScores must be an object")
+        else:
+            for key, value in layer_scores.items():
+                if not isinstance(key, str):
+                    errors.append(f"{label}.layerScores keys must be strings")
+                if not is_number(value) or value < 0 or value > 1:
+                    errors.append(f"{label}.layerScores.{key} must be a number from 0 to 1")
 
 
 def validate_review_history(spec: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
@@ -904,6 +964,42 @@ def validate_review_history(spec: dict[str, Any], errors: list[str], warnings: l
             warnings.append(
                 f"reviewHistory[{index}] continues visual pass {pass_id!r} without a render screenshot"
             )
+        if pass_id in VISUAL_PASS_IDS and action == "continue":
+            if not isinstance(visual, dict) or not visual.get("comparisonImage"):
+                warnings.append(
+                    f"quality: reviewHistory[{index}] continues visual pass {pass_id!r} without an AI vision comparison image"
+                )
+            score = entry.get("aiVisionScore")
+            threshold = entry.get("visualAcceptanceThreshold", 0.7)
+            if not is_number(score):
+                warnings.append(
+                    f"quality: reviewHistory[{index}] continues visual pass {pass_id!r} without aiVisionScore"
+                )
+            elif is_number(threshold) and float(score) < float(threshold):
+                warnings.append(
+                    f"quality: reviewHistory[{index}] aiVisionScore {score} is below threshold {threshold}"
+                )
+            loop = spec.get("selfCorrectLoop")
+            acceptance = loop.get("visualAcceptance", {}) if isinstance(loop, dict) else {}
+            if isinstance(acceptance, dict) and acceptance.get("layerScoresRequired") is True:
+                layer_scores = entry.get("layerScores")
+                if not isinstance(layer_scores, dict) or not layer_scores:
+                    warnings.append(
+                        f"quality: reviewHistory[{index}] continues visual pass {pass_id!r} without layerScores"
+                    )
+                else:
+                    required_layers = acceptance.get("requiredLayerScores", [])
+                    if isinstance(required_layers, list):
+                        missing_layers = [
+                            layer
+                            for layer in required_layers
+                            if isinstance(layer, str) and layer not in layer_scores
+                        ]
+                        if missing_layers:
+                            warnings.append(
+                                f"quality: reviewHistory[{index}] layerScores missing: "
+                                + ", ".join(missing_layers)
+                            )
 
 
 def validate_visual_evidence_history(spec: dict[str, Any], errors: list[str]) -> None:
