@@ -6,9 +6,21 @@ Three.js Object Sculptor is a Codex plugin for rebuilding the visible object in 
 
 ## Demo
 
+### Tower Ship
+
+[Open the live tower ship demo](https://3dship.harrysoftware.com)
+
 ![Procedural Three.js tower ship demo generated from an attached reference image](assets/tower-ship-demo.png)
 
 This tower ship study shows the intended output shape: a browser-rendered, code-sculpted Three.js object rebuilt from an attached reference image, with procedural geometry, articulated parts, material work, and interactive controls.
+
+### Ancient Autumn Tree
+
+[Open the live ancient autumn tree demo](https://tree.harrysoftware.com/)
+
+![Procedural Three.js ancient autumn tree reconstructed from an attached reference image](assets/ancient-autumn-tree-demo.png)
+
+This botanical study reconstructs a complex ancient tree with procedural curves, deterministic branching, layered bark materials, dense autumn foliage, and an animation-ready hierarchy.
 
 ## At A Glance
 
