@@ -3,11 +3,16 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 
 def is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def feature_review_policy(spec: dict[str, Any]) -> dict[str, Any]:
@@ -71,6 +76,13 @@ def feature_gate_failures(
         for review in reviews
         if isinstance(review, dict) and isinstance(review.get("id"), str)
     } if isinstance(reviews, list) else {}
+    evidence = entry.get("evidence")
+    evidence_views = evidence.get("views", []) if isinstance(evidence, dict) else []
+    available_view_ids = {
+        view.get("viewId")
+        for view in evidence_views
+        if isinstance(view, dict) and isinstance(view.get("viewId"), str)
+    } if isinstance(evidence_views, list) else set()
 
     default_threshold = policy.get("criticalDefaultThreshold", 0.8)
     for target in critical:
@@ -81,9 +93,42 @@ def feature_gate_failures(
         if not isinstance(review, dict):
             failures.append(f"critical feature {target_id!r} has no AI vision review")
             continue
-        if review.get("visible") is False:
-            failures.append(f"critical feature {target_id!r} is not visible in the review view")
+        if review.get("visible") is not True:
+            failures.append(
+                f"critical feature {target_id!r} must be explicitly visible in the review view"
+            )
             continue
+        if target.get("requiresDedicatedEvidence") is True:
+            required_view_ids = target.get("reviewViewIds", [])
+            review_view_ids = review.get("viewIds", [])
+            if not isinstance(required_view_ids, list) or not required_view_ids:
+                failures.append(
+                    f"critical feature {target_id!r} has no dedicated reviewViewIds contract"
+                )
+                continue
+            if not isinstance(review_view_ids, list):
+                failures.append(
+                    f"critical feature {target_id!r} review must bind the dedicated viewIds"
+                )
+                continue
+            missing_artifacts = [
+                view_id for view_id in required_view_ids if view_id not in available_view_ids
+            ]
+            if missing_artifacts:
+                failures.append(
+                    f"critical feature {target_id!r} evidence is missing dedicated views: "
+                    + ", ".join(str(view_id) for view_id in missing_artifacts)
+                )
+                continue
+            missing_review_bindings = [
+                view_id for view_id in required_view_ids if view_id not in review_view_ids
+            ]
+            if missing_review_bindings:
+                failures.append(
+                    f"critical feature {target_id!r} review is not bound to views: "
+                    + ", ".join(str(view_id) for view_id in missing_review_bindings)
+                )
+                continue
         score = review.get("score")
         minimum = target.get("minimumScore", default_threshold)
         if not is_number(score):

@@ -1,6 +1,6 @@
 # Pre-Spec Assessment And Quality Contract
 
-Use this reference before authoring an `ObjectSculptSpec`. The purpose is to prevent shallow specs that are technically valid but too vague to recreate the reference object.
+Use this reference while filling the integrated `preSpecAssessment` created by `sculpt init`. It is part of the same `ObjectSculptSpec`, not a separate required file.
 
 Do not use fixed domain profiles. Assess the object from observed traits, complexity, and target fidelity.
 
@@ -14,6 +14,12 @@ Describe the object using multiple axes:
 - material families: wood, bark, leaf, metal, stone, ceramic, plastic, rubber, cloth, glass-like, liquid-like, skin-like, mixed
 
 These are descriptors, not domain templates. Use only what the image supports.
+
+## Sensitive Face And Hand Regions
+
+Inspect visible faces and hands separately from general object complexity. Fill `preSpecAssessment.specializedRegions` and `surfaceTopologyPlan` before creating visual modules: use `declared` with one contract per visible region, or `none` with a reason. A clear region needs a named assembly, landmark-to-geometry mapping, proportion plus expression/pose constraints, dedicated crop views, and its own critical feature target. Landmark names do not require separate meshes; classify continuous tissue, real assemblies, fitted shells, embedded relief, strands, and material-only detail from visible evidence. Partial or occluded anatomy needs explicit unknowns; never infer hidden digits or facial forms as facts.
+
+See `anatomical-regions.md` for the supported landmark, articulation, contact, and evidence contract.
 
 ## Complexity Scoring
 
@@ -33,7 +39,7 @@ Map total judgment to:
 - `simple`: few parts, low detail, one or two materials
 - `moderate`: several parts, visible local detail, shallow hierarchy
 - `complex`: many parts, repeated systems, multiple materials, several hierarchy levels
-- `ultra-complex`: dense organic/mechanical/architectural structure where fidelity depends on deep hierarchy and repeated microstructure
+- `ultra`: dense organic/mechanical/architectural structure where fidelity depends on deep hierarchy and repeated microstructure
 
 ## Quality Contract
 
@@ -56,7 +62,11 @@ Good feature groups are specific to the image:
 
 ## Strict Quality Gate
 
-Run `../../scripts/validate_sculpt_spec.py spec.json --strict-quality` before code generation. The script path is relative to the skill folder.
+Validate the current pass before generation:
+
+```bash
+python3 ../../scripts/sculpt.py validate spec.json --for-pass <current-pass> --strict-quality
+```
 
 If strict validation fails:
 
@@ -66,3 +76,13 @@ If strict validation fails:
 - only lower the quality bar if the user explicitly accepts a simpler approximation
 
 The gate should block code generation when the spec could describe many different objects instead of the provided reference.
+
+## Suitability Decision
+
+Use `pass` when one target occupies enough of the frame, its silhouette and major materials are readable, and hidden geometry can be bounded honestly.
+
+Use `conditional` when the macro form is clear but one view, partial occlusion, organic simplification, static cloth/fiber/glass/liquid/volume approximations, or missing close-ups limit fidelity. Record the limitation and the evidence needed to remove it.
+
+Use `reject` when the target is ambiguous, badly cropped/blurred/hidden, an identity-critical region cannot be bounded, or the request requires exact mesh extraction, manufacturing dimensions, strand grooming, physical simulation, exact caustics, or dynamic volumetrics that this procedural workflow does not provide.
+
+Request front/side/back views, higher resolution, neutral framing, or material/face/hand close-ups only when that evidence can change the decision. For complex targets, require macro/meso/micro structure, every distinct material layer, local overrides, confidence, and source evidence; otherwise keep suitability `conditional` and list the missing proof.

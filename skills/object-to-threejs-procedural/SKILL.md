@@ -1,426 +1,208 @@
 ---
 name: object-to-threejs-procedural
-description: Use when the user provides or references an object image and wants Codex to validate whether the object can be reconstructed in Three.js, then extract a procedural sculpt spec, geometry/material/lighting plan, and implement or guide a code-native 3D model.
+description: Use when the user provides or references an object image and wants Codex to validate whether it can be reconstructed in Three.js, then author a composable procedural sculpt spec, generate geometry/material/lighting code, and validate the real render against the reference.
 ---
 
-# Object To Three.js Procedural
+# Object to Three.js Procedural
 
-Use this skill when the user wants to turn a reference image of an object into a procedural Three.js model, visual spec, reconstruction plan, animation plan, destruction plan, or code implementation. This skill is for code-native reconstruction, not photogrammetry or exact mesh extraction.
+Create an editable procedural Three.js approximation from reference images. Treat it as code-native reconstruction, not photogrammetry, exact mesh recovery, or physically exact PBR inversion.
 
-## Core Promise
+## Required outcome
 
-Treat the task like sculpting from a photo:
+1. Inspect the real reference and decide `pass`, `conditional`, or `reject`.
+2. Write one global contract, then one spec per semantic module as that module is built.
+3. Build and validate the highest-risk ready module first.
+4. Assemble only modules whose current content hash has passed its gate.
+5. Run the existing blockout/form/lookdev/runtime/optimization gates on the assembled model.
 
-1. Validate whether the image contains a suitable 3D object target.
-2. Extract the object as a structured visual and physical description.
-3. Decompose it from coarse forms to small features.
-4. Rebuild it with procedural Three.js geometry, generated materials, lighting, and optional animation/destruction.
-5. Verify visually and technically before calling it done.
+Never claim hidden geometry as observed fact. Label approximations and ask for better evidence only when it can change the result.
 
-Do not pretend a single image can produce an exact production mesh. Be explicit when the output will be an approximate, stylized, low-poly, or physically simplified reconstruction.
+## Inputs and quality choice
 
-## Required Inputs
+Require at least one inspectable image. If intended use is missing, use `browser-prop`; if complexity is unclear, start at `moderate` and revise after inspection.
 
-At minimum:
+Choose the quality profile explicitly. “Game quality”, realistic, sharp, hero asset, or close-reference requests require `reference-fidelity`. Use `game-prop` for rigid real-time assets and `static-render` for still-only work. Do not silently downgrade either choice.
 
-- one image path, screenshot, URL, or attached image
-- the intended use: standalone model, game prop, scene dressing, hero render, playable object, destructible object, or animation rig
+## Command surface
 
-If the image is missing or unreadable, ask for it. If the intended use is missing, assume a browser-real-time Three.js prop with performance suitable for interactive use.
+From this skill directory run:
 
-## Helper Scripts
-
-Use plugin scripts when they make the loop faster or more reliable:
-
-These scripts live at the plugin root, not inside this skill folder. From this `SKILL.md` directory, use `../../scripts/...`.
-
-- `../../scripts/probe_reference_image.py <image>` checks image type, dimensions, aspect ratio, and obvious technical issues. It does not replace visual inspection.
-- `../../scripts/extract_reference_pbr.py <image> --out-dir <dir> --material-id <id> --target-threshold 0.7` extracts reference-derived albedo, roughness, height, normal, and AO maps from image pixels. It exits non-zero when confidence is below the target threshold.
-- `../../scripts/extract_reference_pbr.py <image> --out-dir <dir> --material-id <id> --spec object-sculpt-spec.json --in-place` patches a material with usable `referencePbr` maps only when the confidence gate passes, unless `--allow-low-confidence` is explicitly used.
-- `../../scripts/new_pre_spec_assessment.py "Object Name" --image <path> --complexity <simple|moderate|complex|ultra-complex> --out assessment.json` creates a pre-spec complexity assessment and quality contract skeleton.
-- `../../scripts/new_sculpt_spec.py "Object Name" --image <path> --out object-sculpt-spec.json` creates a starter spec.
-- `../../scripts/new_sculpt_spec.py "Object Name" --image <path> --assessment assessment.json --out object-sculpt-spec.json` creates a starter spec from a completed pre-spec assessment.
-- `../../scripts/validate_sculpt_spec.py object-sculpt-spec.json` validates required fields, score ranges, material references, component IDs, parent links, transforms, and primitive names.
-- `../../scripts/validate_sculpt_spec.py object-sculpt-spec.json --strict-quality` fails when the spec is structurally valid but too shallow for its quality contract.
-- `../../scripts/sculpt_pass_orchestrator.py status object-sculpt-spec.json` reports the current locked build pass and required evidence.
-- `../../scripts/sculpt_pass_orchestrator.py check object-sculpt-spec.json --pass-id blockout` fails unless that pass is currently unlocked or already completed.
-- `../../scripts/sculpt_pass_orchestrator.py sync object-sculpt-spec.json --in-place` refreshes `sculptPipeline` from `reviewHistory`.
-- `../../scripts/generate_threejs_factory.py object-sculpt-spec.json --out src/createObjectModel.ts` creates a TypeScript Three.js factory for the current unlocked build pass only.
-- `../../scripts/generate_threejs_factory.py object-sculpt-spec.json --pass-id structural-pass --out src/createObjectModel.ts` creates a deeper pass only after earlier passes were reviewed with `action=continue`.
-- `../../scripts/make_visual_comparison_sheet.py --reference <image> --render <screenshot> --out <comparison.png> --json` creates one full reference/render comparison pair. AI vision scores the global result and every selected semantic feature from this same pair.
-- `../../scripts/append_sculpt_review.py object-sculpt-spec.json --pass-id <pass> --fidelity <0-1> --action <continue|refine-spec|refine-code|request-input|stop> --summary "..." --render-screenshot <path> --comparison-image <path> --ai-vision-score <0-1> --layer-scores-json '{"silhouetteProportion":0.8}' --feature-reviews-json <reviews.json> --ai-vision-notes "..." --camera-view <view> --in-place` records each self-correction review plus global and feature-level AI vision evidence.
-
-Prefer this loop for implementation tasks:
-
-1. Probe the image if it is local.
-2. Run the Pre-Spec Assessment Gate: classify the object softly, score complexity, and write the quality contract before authoring the full spec.
-3. Create or revise `ObjectSculptSpec` from the completed assessment and quality contract.
-   Replace generic starter `featureReviewTargets` with the object's actual identity-defining semantic systems before strict validation. Keep at most five critical and three important targets per pass.
-4. When material fidelity matters and a source image is available, run `extract_reference_pbr.py` for each important material crop/region before material-pass. Treat confidence below `0.7` as a stop/refine-input signal, not as a pass.
-5. Validate the spec with normal validation, then run `--strict-quality` before code generation.
-6. Generate a factory skeleton only after the strict quality gate passes or after explicitly documenting accepted fidelity limits.
-7. Hand-refine geometry, materials, animation anchors, and destruction anchors one pass at a time. Do not generate or implement a deeper pass until `sculpt_pass_orchestrator.py check` passes for that pass.
-8. After each visual pass, capture a browser screenshot, create one full reference/render comparison pair, inspect it once with AI vision, then update `reviewHistory` with overall, layer, and semantic feature scores.
-9. Run project typecheck/build and browser visual review; use the Codex in-app Browser screenshot tool first. Do not install or download Playwright/Chromium just for this skill unless the user explicitly requests that route.
-
-## 3D Terminology Discipline
-
-Descriptions must be clear, concrete, and compatible with real-time 3D graphics language. When describing the object, prefer terms from `references/3d-graphics-terminology.md`.
-
-Do not rely on vague descriptions such as "nice", "realistic", "smooth", "rough", "bumpy", "shiny", "dark", or "dirty" unless they are translated into technical terms:
-
-- geometry: silhouette, topology intent, primitive family, bevel radius, chamfer, taper, bend, twist, boolean cut, edge loop, local deformation, displacement amplitude
-- material/PBR: albedo/baseColor, roughness, metalness, normal map, bump map, displacement map, ambient occlusion, cavity dirt, edge wear, clearcoat, transmission, alpha
-- surface locality: local mask, procedural noise scale, scratch cluster, chip, dent, seam, recessed groove, raised ridge, stain, dirt accumulation, contact wear
-- lighting/rendering: key/fill/rim light, environment reflection, contact shadow, shadow softness, color temperature, exposure, tone mapping
-- animation/destruction: pivot, hinge, joint, socket, collider, rigid body, fracture seam, detachable fragment, impulse direction
-
-Every important visual claim should name the layer it belongs to: geometry, topology, material, texture, shader parameter, lighting, animation, collision, or destruction. For complex objects, include `terminologyProfile` in the spec and keep local details attached to `viewEvidence`.
-
-## Image Validation Gate
-
-Before planning or coding, inspect the image and return a suitability verdict:
-
-- `pass`: clear object, readable silhouette, reconstructable with procedural primitives
-- `conditional`: possible, but needs assumptions, stylization, extra angles, or reduced fidelity
-- `reject`: not enough object information for a useful procedural reconstruction
-
-Score these 0-3:
-
-- `object_isolation`: one main object, not a crowded scene
-- `silhouette_readability`: outer shape and proportions are clear
-- `depth_inference`: enough cues to infer front/back/side thickness
-- `primitive_decomposition`: can be built from spheres, boxes, cylinders, tubes, lathe/extrude shapes, curves, instancing, or deformed surfaces
-- `material_procedurality`: material can be approximated with colors, roughness, metalness, normals, procedural noise, decals, or vertex colors
-- `occlusion_risk`: hidden parts are limited or can be inferred
-- `interaction_fit`: object can support requested animation, physics, or destruction
-
-Reject or ask for another image when:
-
-- the target object is not identifiable
-- multiple objects compete and the target is ambiguous
-- the object is heavily cropped or hidden
-- the goal requires exact likeness from a single image
-- the subject is mostly text, transparent glass, fur, smoke, liquids, or fine fabric where procedural approximation would dominate the result
-- the requested output is a rigged organic character but only one flat view is available
-
-## Extraction Pass
-
-Before writing the full spec, create a pre-spec assessment. Do not use hardcoded domain profiles. Use observed traits and complexity to decide how deep the spec must be.
-
-### Pre-Spec Assessment Gate
-
-This gate exists to prevent shallow specs. It must happen before `componentTree` and materials are finalized.
-
-Use `references/pre-spec-assessment.md` for the complexity scoring and quality-contract checklist.
-
-Assess:
-
-- object class, using soft descriptors such as organic, hard-surface, mechanical, architectural, botanical-like, character-like, amorphous, repeated-structure, static prop, articulated, deformable, or destructible
-- complexity tier: `simple`, `moderate`, `complex`, or `ultra-complex`
-- silhouette complexity
-- expected component count
-- hierarchy depth
-- repetition density
-- material layer count
-- local detail density
-- occlusion/hidden-structure risk
-- animation/destruction readiness need
-
-Then write a `qualityContract` that states what "good enough" means for this exact object. The contract must include:
-
-- definition of done
-- minimum spec depth: macro components, meso components, micro feature groups, material layers, repetition systems, review viewpoints
-- required feature groups with quality criteria, evidence refs, and failure modes
-- visual delta checks for screenshot review
-- anti-shallow rules that block code generation if the spec is too vague
-
-For a simple object, this can stay compact. For a complex object, the contract must force a deep component hierarchy, repeated systems, material local overrides, and multiple screenshot viewpoints. If the quality contract is still generic enough that it could apply to any object, refine it before generating code.
-
-After passing the pre-spec gate, produce an `ObjectSculptSpec` in prose or JSON-like form. Use schema v2 for complex objects:
-
-```ts
-type ObjectSculptSpec = {
-  targetName: string;
-  schemaVersion: "2.0";
-  terminologyProfile: TerminologyProfile;
-  suitability: "pass" | "conditional" | "reject";
-  assumptions: string[];
-  preSpecAssessment: PreSpecAssessment;
-  qualityContract: QualityContract;
-  coordinateFrame: {
-    front: string;
-    up: string;
-    scaleReference: string;
-  };
-  silhouette: {
-    boundingShape: string;
-    aspectRatios: string[];
-    symmetry: string;
-    dominantCurves: string[];
-  };
-  viewEvidence: ViewEvidence[];
-  componentTree: SculptComponent[];
-  materials: SculptMaterial[];
-  qualityTargets: QualityTargets;
-  selfCorrectLoop: SelfCorrectLoop;
-  sculptPipeline: SculptPipeline;
-  actionReadiness: ActionReadiness;
-  repetitionSystems: RepetitionSystem[];
-  buildPasses: BuildPass[];
-  visualEvidence: VisualEvidence[];
-  reviewHistory: SculptReview[];
-  lodPlan: LodPlan[];
-  performanceBudget: PerformanceBudget;
-  lightingFromPhoto: string[];
-  proceduralStrategy: string[];
-  animationAnchors: string[];
-  destructionAnchors: string[];
-  risks: string[];
-};
+```bash
+python3 ../../scripts/sculpt.py <command>
 ```
 
-For every major component, capture:
+Primary commands are `init`, `views`, `module`, `validate`, `status`, `check`, `generate`, `compare`, `review`, `probe`, `pbr`, and `migrate`. Individual scripts and `--layout monolithic` remain compatibility paths only.
 
-- role: body, base, limb, handle, cap, shell, ornament, connector, surface detail
-- level: macro, meso, or micro
-- importance and confidence from 0 to 1
-- primitive base: box, sphere, cylinder, cone, torus, capsule, tube, lathe, extrude, curve sweep, plane cards, instanced cluster
-- geometry descriptor: topology intent, edge treatment, bevel radius, deformation stack, UV strategy, normal strategy
-- dimensions: width, height, depth, radius, length, taper ratios, and confidence
-- transforms: position, rotation, scale, taper, bend, twist, bevel, boolean cut, noise displacement
-- joints: parent component, overlap, seam, hinge, socket, embedded, glued, floating
-- action profile: animation role, pivot mode/local position/axis, transform channels, sockets, collider proxy, constraints, destruction behavior
-- material layers: base color, palette variation, roughness, metalness, normal, bump, displacement, transparency, edge wear, dirt, moss, scratches, chips, wetness, grain
-- local features: per-region marks, dents, holes, seams, stains, ridges, raised details, carved lines, decals, chips, and wear patches
-- evidence refs: which image region supports this component or local feature
-- fidelity tier: blockout, mid detail, close-up detail
+## Workflow
 
-For complex objects, do not flatten everything into one `details` string. Use:
+### 1. Inspect and write the global contract
 
-- `viewEvidence` to record image regions and observed local traits.
-- `terminologyProfile` to keep descriptions aligned with 3D graphics vocabulary.
-- `material.localOverrides` to describe local color/roughness/bump differences.
-- `component.localFeatures` for geometry-visible details.
-- `component.surfaceDetail` for macro roughness, micro roughness, bump amplitude, normal pattern, and displacement pattern.
-- `repetitionSystems` for repeated screws, leaves, scales, teeth, beads, panels, rivets, holes, or stitches.
-- `buildPasses` to state the sculpt order and acceptance criteria from coarse to fine.
+Inspect silhouette, macro hierarchy, negative spaces, attachments, repeated systems, material families, occlusion, and intended behavior. Identify perceptually fragile or technically uncertain subsystems such as a face, interacting hand, thin structure, transparent surface, dense fibers, deformable fabric, or unusual joint.
 
-Anti-shallow rule: a complex object with only one root component, no repetition systems, no material local overrides, and no micro feature groups is not implementation-ready even if the JSON schema validates.
+Create the v4 root manifest:
 
-## Action-Ready Model Contract
-
-Build every generated model as if the user may later ask for animation, transformation, physics, or destruction. Do not generate a beautiful but inert lump of meshes.
-
-Use `references/action-ready-models.md` for pivot, socket, collider, and destruction hierarchy rules.
-
-The spec should include `actionReadiness`, and every macro/meso component should include `actionProfile`:
-
-- `animationRole`: root, static, articulated, deformable, detachable, breakable, effect-emitter, or socket-only.
-- `pivot`: mode, local position, axis, and confidence. Use a semantic pivot such as base, hinge, joint, center of mass, branch root, handle socket, or custom.
-- `transformChannels`: whether translate, rotate, scale, bend, twist, detach, visibility, or material-state changes are expected.
-- `sockets`: named attachment points for hands, tools, branches, wheels, lids, projectiles, effects, or later child objects.
-- `collider`: simplified runtime proxy such as box, sphere, capsule, cylinder, convex hull, compound, trigger, or none.
-- `constraints`: hinge limits, slide limits, bend limits, spring behavior, parent locks, or physics constraints.
-- `destruction`: breakable flag, fracture group, seam refs, detachable fragments, break impulse, debris material, and effect anchors.
-
-Generation rules:
-
-- Put each independently transformable part under a stable `THREE.Group` pivot node; put the visual mesh as its child.
-- Store runtime maps in `root.userData.sculptRuntime`: `nodes`, `meshes`, `sockets`, `colliders`, and `destructionGroups`.
-- Avoid merging parts that may move, detach, bend, break, swap materials, or receive independent collision later.
-- Use procedural seams and component boundaries as future break lines; do not rely on random explosions.
-- If the object truly has no moving parts, still include a root pivot, whole-object collider, and destruction policy so later whole-object actions remain easy.
-
-## Self-Correction Loop
-
-Construction must be a feedback loop, not a blind one-way generation.
-
-After every build pass, pause and review against the source image, user requirements, `qualityTargets.mustMatch`, and the current `ObjectSculptSpec`.
-
-Use this review shape:
-
-```text
-passId:
-estimatedFidelity: 0..1
-matched:
-mismatches:
-rootCause: spec gap | code gap | rendering/lighting gap | reference ambiguity | performance tradeoff
-decision: continue | refine-spec | refine-code | request-input | stop
-specFixes:
-codeFixes:
-evidence:
-visualEvidence:
-  referenceScreenshot:
-  renderScreenshot:
-  comparisonImage:
-  cameraView:
-  notes:
-  aiVisionNotes:
-aiVisionScore: 0..1
-visualAcceptanceThreshold: 0..1
-layerScores:
-  silhouetteProportion: 0..1
-  componentStructure: 0..1
-  formDetail: 0..1
-  materialSurface: 0..1
-  lightingCamera: 0..1
-featureReviews:
-  - id:
-    score: 0..1
-    visible: true
-    notes:
+```bash
+python3 ../../scripts/sculpt.py init "Object Name" \
+  --image <reference> \
+  --complexity <simple|moderate|complex|ultra> \
+  --intended-use <static-render|browser-prop|game-prop|animated|playable|destructible> \
+  --quality-profile <balanced|reference-fidelity> \
+  --out object-sculpt.json
 ```
 
-Decision rules:
+Fill `globalSpec.preSpecAssessment`, silhouette, coordinate frame, quality contract, source observations, known risks, and `surfaceTopologyPlan` before creating geometry modules. Classify each visible system as `continuous-sculpt`, `assembled-solid`, `conforming-shell`, `surface-relief`, `fiber-strand`, or `material-only`. Semantic landmarks may share one mesh. A new visual module is refused until the plan is `planned` and contains a group whose `ownerModuleId` matches that module. The manifest initially contains only the global assembly root; this is intentional.
 
-- `continue`: current pass meets its acceptance criteria and does not threaten later quality.
-- `refine-spec`: the implementation revealed the spec is wrong, incomplete, ambiguous, or missing component/material/local feature detail.
-- `refine-code`: the spec is adequate, but the generated geometry/material/lighting does not match it.
-- `request-input`: required information is hidden in the image or user expectations conflict with the available evidence.
-- `stop`: target fidelity is reached, user accepted the approximation, or remaining gaps require new references/manual art.
+If `viewHypothesisPolicy.enabled` is true, use built-in ImageGen once per required named view at this point—not once per pass. Preserve identity and generate only the requested `three-quarter`, `side`, or `back` hypothesis without redesigning the object. Register the resulting files once; `views status` reuses them while the source hash and prompt version remain unchanged:
 
-When the decision is `refine-spec`, revise the spec first, re-run `../../scripts/validate_sculpt_spec.py`, then continue implementation. Do not patch code around a bad spec. When the decision is `refine-code`, keep the spec stable and fix the factory/material/render code.
+```bash
+python3 ../../scripts/sculpt.py views register object-sculpt.json \
+  --view three-quarter=review/three-quarter.png \
+  --view side=review/side.png \
+  [--view back=review/back.png]
+python3 ../../scripts/sculpt.py views status object-sculpt.json
+```
 
-Record review entries with `../../scripts/append_sculpt_review.py` whenever there is a spec file. If there is no spec file yet, write the same review summary in the response before continuing.
+These images are cached planning/veto evidence. They can expose bad depth, silhouette, or stacked-blob geometry, but inferred color/roughness/detail is not material truth and cannot veto lookdev. They can never approve a module or pass. If ImageGen changes an existing cached view, increment the prompt version explicitly instead of silently replacing evidence.
 
-### Screenshot Feedback Gate
+### 2. Add semantic modules
 
-For browser-renderable construction, screenshots are mandatory feedback, not optional decoration. Codex should not decide that a visual pass is good enough from code inspection alone. Code must not be the final image-comparison authority: the final pass decision comes from AI vision inspecting a side-by-side reference/render sheet.
+Decompose by independently reviewable systems, not by arbitrary mesh count. Examples include `face-identity`, `gripping-hand`, `instrument`, `body-clothing`, `tail`, or `hard-surface-core`.
 
-Use `references/browser-screenshot-feedback.md` for the detailed screenshot comparison checklist.
-Use `references/material-lighting-realism.md` when the shape is acceptable but material, color, texture, or lighting fidelity is still weak.
-Use `references/attachment-joint-correctness.md` when parts attach to parents: branches, limbs, handles, legs, horns, wings, cables, tubes, sockets, hinged parts, or decorative appendages.
+Do not turn every named region into a mesh. Preserve a single surface when the reference shows an uninterrupted material/form transition: head, cheeks, muzzle, jaw, muscle masses, rock bulges, and branch junctions normally belong to one continuous host. Separate only observed seams, sockets, articulation boundaries, accessories, shells, or real strands. Put silhouette-changing relief into the host surface; use material response for sub-silhouette microdetail.
 
-Use this order:
+```bash
+python3 ../../scripts/sculpt.py module add object-sculpt.json <module-id> \
+  --role "<semantic responsibility>" \
+  --risk-score <0..100> \
+  --gate-type <visual|structural> \
+  [--covers <global-feature-group-id>] \
+  [--depends-on <module-id>] \
+  [--template foundation]
+```
 
-1. Render the current model in the browser or project preview.
-2. Capture a screenshot at the relevant review viewpoint from `qualityTargets.reviewViewpoints`.
-3. Select semantic review targets for this pass:
-   - `critical`: at most five identity-defining or high-risk systems; every one must pass independently.
-   - `important`: review adaptively, at most three suspicious systems; their reviewed average must pass.
-   - `detail`: note mismatches without blocking the pass.
-   Group repeated parts into one semantic system. Do not create a target for every mesh.
-4. Create one comparison artifact with `../../scripts/make_visual_comparison_sheet.py --reference <image> --render <screenshot> --out <comparison.png>`.
-5. Inspect the comparison image with Codex AI vision and score it by layer:
-   - silhouette/proportion
-   - component placement and hierarchy
-   - local geometry features
-   - material albedo, roughness, metalness, normal/bump/displacement
-   - lighting, shadows, exposure, and camera angle
-6. From that same full image pair, score every critical semantic feature independently. A failed critical feature fails the pass even when the global score is high.
-7. Classify each mismatch as a spec gap, code gap, rendering/lighting gap, reference ambiguity, or performance tradeoff.
-8. Record the screenshot pair, comparison image, overall AI vision score, layer scores, feature scores, and critique in `reviewHistory.visualEvidence` and `visualEvidence`.
+Keep dependencies minimal. A module may parent into `root`, or into a dependency only through that dependency’s exported connector. Component, material, repetition, feature-target, and specialized-region IDs must be globally unique. Use `structural` only for assembly/interface nodes and connectors; any module that owns visible geometry, materials, repetitions, evidence, or specialized regions must use `visual`.
 
-Default to the Codex in-app Browser screenshot tool when available. Playwright/Chromium is not the default validation path for this skill; do not install or download a browser runtime merely to get screenshots unless the user explicitly asks for that route. If no screenshot can be captured, no comparison sheet exists, AI vision has not reviewed it, the global score is below threshold, or any critical semantic feature is below its threshold, do not choose `continue`; choose `refine-spec`, `refine-code`, `request-input`, or explain the blocker.
+`--template foundation` is only an editable visual scaffold. Replace its explicit placeholder geometry/material text with observed decisions; `--strict-quality` refuses an untouched scaffold. In every visual module, list the exact project-relative runtime sources/assets that create its render under `contract.implementationFiles`. At least one declared runtime source must contain the executable ownership marker `export const SCULPT_MODULE_ID = "<module-id>";`; a comment or another module's source is rejected. That marker is ownership metadata, not proof of what was rendered: the app must instantiate the generated module's stable `createSculptModel` export.
 
-Minimum gates:
+Use face/hand modules when visible, but keep the architecture general: any difficult subsystem can be isolated and reviewed first. Do not create one builder sub-agent per module by default. After a visual comparison exists, use one fresh reviewer sub-agent that did not build the module; give it only the raw reference, render/contact sheet, and contracts—not the builder’s proposed score or defense.
 
-1. `blockout`: screenshot proves silhouette, proportions, primitive family, and coordinate frame.
-2. `structural-pass`: screenshot proves component hierarchy, parent/child placement, joints, seams, repeated systems, and stable action-ready node boundaries.
-3. `form-refinement`: screenshot proves bevel/chamfer/taper/bend/deformation, local geometry features, and no floating child joints.
-4. `material-pass`: screenshot proves albedo, roughness, metalness, normal/bump/displacement, AO, dirt, wear, local overrides.
-5. `lighting-pass`: screenshot proves reference-independent material readability plus optional reference lighting match.
-6. `interaction-pass`: screenshot or short render capture proves pivots, sockets, colliders, animation anchors, fracture seams, detachable fragments, and runtime metadata.
-7. `optimization-pass`: triangle budget, draw calls, instancing, LOD, and FPS target.
+### 3. Build the hardest ready module first
 
-### Locked Build Pass Gate
+```bash
+python3 ../../scripts/sculpt.py module context object-sculpt.json
+```
 
-The construction loop is sequential. Codex must not jump from a completed spec directly to a polished model.
+`module context` selects the highest-risk ready module and returns one hash-aware work packet: module/dependency/runtime paths, only files changed since the previous context call, directly readable relevant reference paths, required views/layers, and any pending correction batch. References are part of the hash-tracked `files`/`readFiles` set, so read only the listed `readFiles` paths in one parallel tool call. Do not reopen an unchanged file when `cacheHit=true`; use `module status` or individual reads only for diagnosis after a concrete failure. A structural module returns one `accept` action instead of the visual build/evaluate/review route; `module accept` runs the same strict module check internally.
 
-Before each implementation pass:
+Author the complete module or pending correction batch before running validation. Then strict-check, resolve, validate, and generate with one fail-fast command:
 
-1. Run `../../scripts/sculpt_pass_orchestrator.py status object-sculpt-spec.json`.
-2. Run `../../scripts/sculpt_pass_orchestrator.py check object-sculpt-spec.json --pass-id <pass>`.
-3. Generate or edit only the unlocked pass.
-4. Render in the Codex in-app Browser and capture screenshot evidence.
-5. Build one full reference/render comparison sheet with `../../scripts/make_visual_comparison_sheet.py`.
-6. Inspect it once with AI vision and record overall, layer, and critical semantic feature scores plus concrete mismatch notes.
-7. Append review with `../../scripts/append_sculpt_review.py ... --pass-id <pass> --action continue --render-screenshot <path> --comparison-image <path> --ai-vision-score <0-1> --layer-scores-json '<json>' --feature-reviews-json <reviews.json> --ai-vision-notes "..." --camera-view <view> --in-place`.
-8. Run `../../scripts/sculpt_pass_orchestrator.py sync object-sculpt-spec.json --in-place` when review history was edited manually.
+```bash
+python3 ../../scripts/sculpt.py module build object-sculpt.json <module-id>
+```
 
-The default generator is pass-gated. Calling `generate_threejs_factory.py` without `--pass-id` uses `sculptPipeline.currentPass`. Calling it with a future `--pass-id` must fail until prior passes are completed. This is intentional: first sculpt the blockout, then structure, then form, then material and surface detail.
+The default outputs are `.sculpt-preview/<module-id>.json`, `.sculpt-preview/<module-id>.build.json`, and `src/generated/<module-id>.generated.ts`. `module build` invokes the same strict module check, resolver, spec/pass validation, unlock check, and generator as the individual commands; it stops at the first failed stage and reports that stage without weakening any gate. The build receipt binds the current module/spec to the exact generated factory hash and factory ID.
 
-Material and lighting passes have extra look-dev gates. `material-pass` must not proceed with only flat base colors; it needs palette, roughness variation, normal/bump/displacement intent, and local masks. `lighting-pass` must not proceed with ambient-only lighting; it needs key/fill/rim or environment light, exposure, tone mapping, background, shadow softness, and contact shadow behavior.
+Fix structural/schema failures before rendering. A visual module cannot pass with executable `fidelityTier: blockout` parts. Capture every required and diagnostic view and create one no-crop comparison manifest. Run deterministic preflight before creating a reviewer sub-agent; a failed preflight goes directly back to the builder and spends no reviewer call. Only after it passes, spawn one fresh reviewer sub-agent with no builder rationale or proposed scores. Give it the raw reference, render/contact sheet, evidence hash, and module contract. The reviewer returns the structured verdict described in `references/self-correction-loop.md`.
 
-When `lookDevTargets.qualityPriority` is `reference-fidelity`, apply the quality-first gate:
+Use the smallest real geometry system that matches the form. Prefer `sculpted-surface` for one irregular connected mass with embedded bulges/ridges/creases, `section-loft` for continuous forms governed by ordered cross-sections, `conforming-shell` for fitted static layers, `branch-network` for tapered branching layouts whose overlapping junctions are acceptable, and `surface-scatter` for masked repeated details. A hero tree, horn junction, or organic branch that must be topologically fused uses `sculpted-surface`, not `branch-network`. A `sculpted-surface` combines sphere/ellipsoid/capsule sources plus local `inflate`, `pinch`, `ridge`, and `crease` operations into one welded indexed mesh; its single-surface connectivity and closed bounds are validated before generation. Linked shells/scatter must be identity-transform children of their `section-loft` host; put the host's final fitted form in its sections instead of adding a later deformation stack. Generic bend/taper/bulge/twist/noise modifiers remain available for standalone parts.
 
-- important close-up materials use independent albedo, roughness, height/normal, and AO channels
-- surface response is decomposed into macro, meso, and micro frequency bands
-- important procedural maps are at least 1024px, preferably 2048px
-- if a source image exists, important close-up materials have usable `referencePbr` pixel extraction with confidence >= the configured target threshold, default `0.7`
-- UV/projection and texel-density intent are explicit
-- silhouette-affecting relief uses geometry or displacement-capable topology
-- material review includes neutral, grazing-light close-up, and reference-matched screenshots
-- optimization happens after fidelity is accepted; do not remove reference-critical geometry merely to hit an arbitrary polygon floor
+After the real app has instantiated `createSculptModel`, attach its root to the rendered `THREE.Scene`. At the same scene state used for screenshots, save the JSON returned by `window.__THREEJS_SCULPT_CAPTURE_RUNTIME__()` to `review/<module-id>-runtime.json`. Review-only ground/contact-shadow meshes may use `userData.reviewOnly = true`; any other intentional environment mesh must use `userData.sculptValidationRole = "environment"`. Do not hide the generated root or place an untracked substitute model in front of it.
 
-Reference PBR extraction is an inference gate, not a magic guarantee. From one photo, Codex cannot uniquely recover true physical albedo, roughness, height, normal, and AO. If the extractor confidence is below the target threshold or the rendered material still fails screenshot review, choose `request-input`, `refine-spec`, or `refine-code` instead of pretending the material reached the requested fidelity.
+After the real app has captured all required views and the runtime receipt, create the comparison and run deterministic preflight together:
 
-Structural and form passes have an attachment gate. Child appendages such as branches, limbs, handles, legs, horns, wings, tubes, cables, connectors, and hinged parts must include `attachment.parentSocket`, `localStart`, `localEnd`, `contactType`, `embedDepth` or `overlap`, and `gapTolerance`. The generator should build these parts from root endpoint to tip endpoint instead of centering them at an arbitrary transform.
+```bash
+python3 ../../scripts/sculpt.py module evaluate object-sculpt.json <module-id> \
+  --pairs-json review/<module-id>-pairs.json \
+  --runtime-receipt review/<module-id>-runtime.json
 
-The agent should be willing to say: "This cannot reach the requested fidelity from the current image." That is a valid self-correction result.
+# Only when evaluate reports ok=true: spawn a fresh reviewer sub-agent.
+python3 ../../scripts/sculpt.py module review object-sculpt.json <module-id> \
+  --verdict-json review/<module-id>-verdict.json \
+  --evidence-manifest review/<module-id>-evidence.json
+```
 
-## Reconstruction Strategy
+Keep one command budget per module work cycle: one `context`, one complete edit/patch batch, one `build`, one application typecheck if the project build does not already include it, one render capture, one `evaluate`, then one independent `review`. Do not typecheck, build, render, or reread files between individual edits. Repeat a stage only after its inputs changed or its previous failure produced a new falsifiable fix. The individual `status`, `check`, `resolve`, `generate`, `compare`, and `preflight` commands remain debugging/compatibility paths, not the default workflow.
 
-Use a layered sculpting workflow:
+One `module review` call records either a rejected/refine attempt or a passing acceptance; do not add a second bookkeeping command. A refine verdict must enumerate every currently visible actionable issue and produces one atomic `pendingCorrectionBatch`. Apply the entire batch before rendering again—never render/review between individual corrections. Use `refine-batch` with per-correction `scope: spec|code` when both change. `module status.correctionBatchProgress` must report `readyToRender: true` before capture; otherwise keep editing the same batch. A passing preflight writes a hash-bound receipt, while an incomplete/no-op batch is rejected before spending a reviewer call. The workflow preserves the reviewed render baseline inside `.sculpt-cache`, so normal fixed output filenames may be overwritten safely. At most two atomic batches are allowed per strategy. If both fail, record one `strategy-reset` tied to the stable blocker `rootCauseKeys`, explain the different representation and its falsifying check, then make a material spec or executable change before one new render. Do not ask the user merely because the batch budget ended: `request-input` requires concrete missing evidence and the exact criterion it blocks; `stop` requires verified capability evidence. `continue` is refused when diagnostics are invalid, a required feature fails, a blocking issue remains open, or refinement lacks a perceptible improvement. Risk/profile score floors, required visual layers, and diagnostic veto floors cannot be lowered inside a module. For an assembly-only structural gate use `module accept`. Acceptance is fail-closed and stored in `.sculpt-cache`; visual records bind the exact generated factory/live scene, declared implementation snapshot, module, verdict, evidence, render receipt, and dependency interfaces by hash.
 
-1. `blockout`: build the silhouette with simple primitives and correct proportions.
-2. `structural pass`: add child components, sockets, supports, hinges, handles, legs, branches, fins, or ribs.
-3. `form refinement`: bevel hard edges, taper cylinders, bend tubes, add curve sweeps, add organic noise, and break perfect symmetry where the image demands it.
-4. `surface pass`: add generated normal maps, procedural noise, vertex colors, bark/stone/metal/plastic/cloth patterns, scratches, wetness, dirt, edge highlights, and small repeated geometry only where it matters.
-5. `material pass`: tune roughness/metalness/clearcoat/transmission/alpha so surfaces do not look like plastic unless they should.
-6. `lighting pass`: separate actual object material from photo lighting; create a neutral turntable light plus optional reference-matching light.
-7. `interaction pass`: add pivots, bones, colliders, animation handles, break points, and detachable fragments only when the user needs motion or destruction.
-8. `optimization pass`: instance repeated details, merge static pieces where safe, cap geometry density, and preserve FPS targets.
+Do not use ImageGen output as reference truth or passing evidence. Registered synthetic views must remain `synthetic-hypothesis` + `planning-veto`; observed source/render evidence remains authoritative.
 
-## Three.js Implementation Rules
+### 4. Assemble and run the normal quality passes
 
-- Prefer TypeScript and plain Three.js unless the existing project uses another Three wrapper.
-- Use `Group` factories such as `createObjectNameModel(spec, options)` rather than scattered mesh creation.
-- Keep reconstruction data separate from renderer objects so the spec can be revised without rewriting the scene.
-- Use deterministic seeds for procedural noise, surface variation, and repeated details.
-- Generate unrelated PBR channels from independent deterministic fields. Never alias the albedo texture into roughness, height, normal, or AO.
-- Use macro/meso/micro frequency bands for tactile materials; single-frequency random marks usually read as synthetic.
-- For quality-first targets, spend polygons on silhouette-affecting relief and use 1024-2048px maps for close-up materials before reducing quality for performance.
-- Preserve local material traits in code metadata (`userData`) even when the first generated geometry is only a blockout.
-- For real-time scenes, prioritize silhouette and material believability over hidden micro-geometry.
-- Use geometry primitives, `Shape` extrusions, curve/tube geometry, instancing, displacement/noise, and generated canvas textures before importing external art.
-- Use mesh hierarchy for future animation: body root, movable limbs, hinged parts, detachable pieces, and effect emitters.
-- For attached children, place the pivot at the attachment root/socket and orient geometry from `attachment.localStart` to `attachment.localEnd`.
-- For destruction, define fracture groups and seams explicitly instead of randomly exploding the entire object.
-- Add a simple reference camera/turntable or screenshot angle for visual comparison.
+Final validation and generation remain locked until every required module has a current acceptance, every required feature group has exactly one explicit owner mode (`--covers` on one visual module or `coverageContract.assemblyFeatureGroups` with a matching critical assembled-pass target), and the fully resolved spec passes strict validation. Module acceptance means only “ready to assemble”, not “asset complete”.
 
-## Lessons From The Pine Forest Prototype
+```bash
+python3 ../../scripts/sculpt.py validate object-sculpt.json \
+  --for-pass <current-pass> --strict-quality
 
-Apply these hard-won patterns:
+python3 ../../scripts/sculpt.py generate object-sculpt.json \
+  --out src/generated/Object.generated.ts \
+  --wrapper-out src/Object.ts
+```
 
-- Vague "make it better" feedback is weak. Convert visual critique into named resets: `Material Realism Reset`, `Silhouette Reset`, `Water Surface Reset`, `Vegetation Structure Reset`, etc.
-- A believable model needs geometry, material, lighting, and scale to agree. Fixing only one layer usually makes the result look artificial.
-- Avoid perfect procedural smoothness. Add controlled unevenness: bevel variation, color mottling, roughness variation, micro normals, dirt at seams, edge wear, and asymmetry.
-- Keep visual progress visible in the browser. Small loops beat large invisible rewrites.
-- Protect performance: instance repeated details, keep collision simplified, and avoid geometry that only exists to hide a bad material.
-- When the user compares against a reference image, explicitly name the mismatch before changing code.
+Once modules are accepted, `status` includes the assembled pass workflow. Run the real application and `compare`, then run deterministic preflight:
 
-## Output Format
+```bash
+python3 ../../scripts/sculpt.py review object-sculpt.json \
+  --pass-id <current-pass> \
+  --evidence-set-json review/<pass>-evidence.json \
+  --preflight-only
+```
 
-For analysis-only requests, return:
+Only when it reports `ok: true`, spawn one fresh reviewer sub-agent and record its verdict unchanged:
 
-1. Suitability verdict and scores.
-2. Target object extraction.
-3. Component hierarchy from macro to micro.
-4. Geometry strategy.
-5. Material and lighting recipe.
-6. Animation/destruction feasibility.
-7. Implementation plan and risks.
+```bash
+python3 ../../scripts/sculpt.py review object-sculpt.json \
+  --pass-id <current-pass> \
+  --evidence-set-json review/<pass>-evidence.json \
+  --verdict-json review/<pass>-verdict.json \
+  --in-place
+```
 
-For implementation requests, do the same briefly, then edit code. Verify with typecheck/build and, when a browser scene exists, inspect screenshots or render output.
+For modular visual passes, manual `--ai-vision-score` or `--reviewer-model` input is not acceptance authority. The pass verdict must bind the current pass/spec/comparison hashes, a current preflight receipt, and different builder/reviewer context IDs. The receipt is consumed after the verdict is recorded, so a new attempt needs a new preflight. Keep `*.generated.ts` generator-owned and hand-written integration in the wrapper.
 
-## Failure Handling
+The adaptive pass plan remains:
 
-If reconstruction is not feasible from the provided image, do not fake confidence. Explain the blocker and ask for one of:
+- `blockout`: silhouette, framing, masses, proportions;
+- `structure`: only for complex/ultra hierarchy and contacts;
+- `form`: recognizable geometry and local form;
+- `lookdev`: material, special surface, lighting, and contact shadow;
+- `interaction`: only for animated/playable/destructible use;
+- `optimization`: only for real-time use, with measured metrics and a fresh visual no-regression review.
 
-- front/side/back reference images
-- cleaner image with isolated object
-- acceptance of a stylized approximation
-- permission to use generated placeholder interpretation
-- a narrower target such as only silhouette, only material study, or only animation/destruction design
+Do not add empty passes to simulate rigor. The useful gates are module, assembly, and final visual/runtime quality.
+
+## Non-negotiable rules
+
+- Use named assemblies and geometry-bearing parts; keep one acyclic global root.
+- Use geometry for silhouette-changing forms. Unsupported primitives or modes must fail, never silently become boxes.
+- Bind appendages with parent/socket/endpoints/contact/overlap/gap data and inspect hidden joints from useful angles.
+- Keep albedo, roughness, normal/height, and AO independent. A material crop can provide inferred PBR evidence, not physical truth.
+- Model visible face and hand landmarks as real named geometry regions with independent close-up gates; do not accept a generic face sphere or hand blob.
+- Treat landmark/region names as semantic review handles, not automatic mesh boundaries. Enforce every planned `continuous-sculpt` group as one connected host and every `surface-relief` group as embedded in that host.
+- Treat static cloth, fibers, glass, liquid, and volume as explicit bounded approximations; do not imply simulation, strand grooming, caustics, or raymarched scattering.
+- Keep fitted shells and surface scatter tied to an undeformed final `section-loft`; never accept a visually detached layer or stacked-blob substitute.
+- Diagnostics may veto obvious framing/silhouette/detail failures but cannot approve a visual gate.
+- Run deterministic preflight before spawning a reviewer; do not spend independent review on evidence that already fails hashes, provenance, required views, or pixel vetoes.
+- A builder must not author, rewrite, rescore, or override the independent verdict used by `module review` or modular assembled `review`.
+- `continue` requires current, hash-bound evidence and every applicable critical feature threshold.
+
+## Completion gate
+
+Do not claim completion until all modules are accepted, the assembled spec validates, generated TypeScript compiles with `three`, the real app loads without relevant errors, every selected pass is complete, all visual evidence is bound to the reviewed artifact, and runtime/metric passes contain real proof.
+
+If any check cannot run, state that limitation instead of implying success.
+
+## Reference routing
+
+For module work, follow the `module context.references` list and load those files together; do not preload all references. Outside a module, read only what the current work requires:
+
+- suitability, complexity, and global quality contract: `references/pre-spec-assessment.md`;
+- geometry and representation patterns: `references/procedural-patterns.md`;
+- face and hand contracts: `references/anatomical-regions.md`;
+- attachment correctness: `references/attachment-joint-correctness.md`;
+- material, PBR, and lighting: `references/material-lighting-realism.md`;
+- interaction/physics/destruction: `references/action-ready-models.md`;
+- screenshot evidence and score layers: `references/browser-screenshot-feedback.md`;
+- root-cause and next-action choice: `references/self-correction-loop.md`;
+- terminology: `references/3d-graphics-terminology.md`.

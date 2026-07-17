@@ -15,25 +15,31 @@ A procedural object often fails after the shape pass because the render has:
 
 Treat this as a `LookDev Reset`, not a geometry problem.
 
-## Material-Pass Requirements
+## Lookdev Material Requirements
 
-Before implementing or accepting `material-pass`, the spec must contain:
+Before accepting `lookdev`, the spec must contain:
 
 - `albedo` palette: dominant, secondary, accent colors, and where they appear on the object.
 - `roughness` response: base value, variation, and local response such as smoother worn edges or rougher cavities.
 - tactile response: at least one of `normal`, `bump`, or `displacement` with scale/amplitude/strength.
 - locality: `localOverrides`, dirt, wear, scratches, chips, stains, moss, patina, wetness, soot, or cavity masks tied to `viewEvidence`.
 - material-specific behavior: alpha/transmission/translucency for thin or transparent parts, metalness/clearcoat for reflective parts, cloth/fiber grain for fabric-like parts.
+- explicit special response: select `materialProfile` only when `cloth`, `fiber`, `glass`, `liquid`, or `volume` behavior is needed; omitted profiles stay on the standard material path.
 - independent PBR channels: albedo, roughness, height/normal, and AO must be generated or authored separately; never reuse albedo as a roughness, height, normal, or AO map.
-- reference-derived PBR extraction: when a source image is available and fidelity matters, run `../../scripts/extract_reference_pbr.py` for each important material or crop before accepting material-pass. The default target threshold is `0.7`; below that, stop or request better references unless the user explicitly accepts a lower-fidelity approximation.
+- reference-derived PBR extraction: for `reference-fidelity`, crop one material region and run `python3 ../../scripts/sculpt.py pbr` with `--material-crop-confirmed` and an explicit `--url-prefix`. Never patch from a full UI/demo screenshot. Below the configured suitability target, stop or request better material evidence.
 - scale hierarchy: close-up materials must describe macro, meso, and micro surface-frequency bands with object-relative frequency and amplitude.
 - projection/UV intent: state UV, triplanar, cylindrical, planar, or another projection strategy, plus repeat/texel-density intent so detail does not stretch across scaled components.
 - quality-first resolution: use at least 1024px procedural maps for important close-up materials and prefer 2048px when reference fidelity is the priority.
+- runtime/offline split: author important 2048px reference maps offline with material masks and tile-safe borders; keep runtime procedural fallback bounded so map generation does not stall the browser.
 - geometric relief: if a ridge, crack, seam, chip, bark plate, fold, or dent affects the visible silhouette, represent it with geometry or displacement-capable topology instead of texture alone.
 
 Do not accept "brown bark", "gold leaves", "dark metal", or "rough stone" as sufficient. Translate it into PBR terms: albedo palette, roughness, normal/bump, AO, dirt/wear, and local masks.
 
 Do not claim exact PBR recovery from a single image. Pixels include baked lighting, exposure, shadow, view angle, and camera response. Treat extracted maps as reference-derived material evidence that still needs neutral/grazing/reference screenshot review.
+
+An executable `localOverrides` entry needs `id`, a supported surface `type`, `amount`, `color`, at least one `evidenceRefs` id, and a `mask` with `pattern` (`noise`, `cavity`, `edge`, `vertical`, `speckle`, or `streak`). Use paired `mask.uvCenter`/`uvScale` plus `feather` when evidence confines the effect to one UV region. Optional `roughnessDelta`, `metalnessDelta`, and `heightDelta` alter independent map channels. Put scratches and chips here as `scratch`/`chip` layers; descriptive arrays alone do not change the shader. A `material-map-evidence` entry is provenance only and must never count as an applied dirt/wear layer.
+
+Use `specularIntensity`, `specularColor`, and `envMapIntensity` to control dielectric reflection strength independently from roughness. These values are authored estimates unless multi-light or measured material evidence is available.
 
 Do not accept a material merely because all required fields are present. The browser render must prove that:
 
@@ -43,10 +49,11 @@ Do not accept a material merely because all required fields are present. The bro
 - referencePbr maps, when present, are loaded by the generated Three.js material and have confidence at or above the configured threshold
 - micro detail does not visibly tile or swim when the object is scaled
 - local overrides appear in the same regions supported by `viewEvidence`
+- color distribution, edge/detail density, and highlight coverage/energy are not grossly inconsistent with the reference diagnostics
 
-## Lighting-Pass Requirements
+## Lookdev Lighting Requirements
 
-Before accepting `lighting-pass`, the spec must contain:
+The same `lookdev` review must also contain:
 
 - key light direction, color temperature, intensity, and shadow softness
 - fill light color/intensity, or explicit reason for no fill

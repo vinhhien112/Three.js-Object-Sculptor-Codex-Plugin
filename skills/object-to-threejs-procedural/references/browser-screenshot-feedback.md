@@ -9,16 +9,25 @@ Each visual build pass should produce at least one rendered screenshot from a na
 Create a side-by-side review image after capture:
 
 ```bash
-../../scripts/make_visual_comparison_sheet.py \
+python3 ../../scripts/sculpt.py compare \
   --reference reference.png \
   --render render.png \
   --out comparison.png \
+  --manifest-out evidence.json \
   --json
 ```
 
-The script only aligns and packages evidence. It must not calculate the acceptance score. Codex AI vision must inspect `comparison.png`.
+For a v4 module, also pass `--sculpt-manifest object-sculpt.json --module-id <module-id>` so the evidence contains the required render receipt for the exact module and implementation snapshot.
 
-Use the same full image pair to score at most five critical semantic features per pass. A feature is a subsystem such as a hull, cabin system, roof system, limb assembly, face, control panel, or sail-and-rigging system. It is not an individual mesh and does not need a separate crop. Score up to three uncertain important features only when adaptive escalation is useful.
+The script aligns and packages evidence, verifies real image inputs, and hashes the exact artifacts. It must not calculate the acceptance score. A genuinely fresh Codex vision reviewer—not the builder with a renamed ID—must inspect `comparison.png`, and the verdict must bind its exact hash and both context IDs.
+
+When `--diagnostics-dir` is used, inspect the silhouette overlay and manifest metrics to correct camera/framing before geometry. Red is reference-only, cyan is render-only, and white is overlap. Missing/empty masks and gross silhouette/framing/detail mismatch are hard vetoes; good diagnostics still cannot unlock a pass.
+
+The layout uses contain/no-crop fitting. For multi-view passes, use `--pairs-json` and `--manifest-out`; all required views go into one contact sheet and one immutable manifest.
+
+Every new evidence view records `referenceProvenance`. Real user/source references use `origin: observed` and `allowedUse: acceptance`. Registered ImageGen `three-quarter`/`side`/`back` hypotheses use `origin: synthetic-hypothesis` and `allowedUse: planning-veto`; they may veto cross-view silhouette/depth failures but their inferred material appearance is not truth. Required acceptance views remain observed evidence, while both module and assembled sheets may include synthetic diagnostic rows that never approve.
+
+Use the same contact sheet to score critical semantic systems up to the configured policy cap. A normal feature is a subsystem such as a hull, cabin system, roof system, limb assembly, control panel, or sail-and-rigging system; it is not an individual mesh. Declared face and hand regions are the exception: each stays independent and requires its configured close-up view in that same contact sheet. Score up to three uncertain important features only when adaptive escalation is useful.
 
 The starter spec contains generic review targets only as placeholders. Replace them with object-specific systems discovered during pre-spec assessment; otherwise strict quality validation should not pass a moderate or complex object.
 
@@ -34,15 +43,7 @@ Review screenshot evidence in this order:
 6. Lighting/camera: exposure, shadow softness, contact shadows, color temperature, rim light, reflection readability.
 7. Performance tradeoff: whether missing detail is intentional because of triangle, draw call, texture, or FPS budgets.
 
-## Decision Matrix
-
-- If the screenshot reveals a missing or wrong component, choose `refine-spec`.
-- If the spec describes the component but the render does not match it, choose `refine-code`.
-- If the screenshot is too dark, too close, too far, or from the wrong viewpoint, choose `refine-code` for camera/lighting before judging model fidelity.
-- If the source image does not reveal enough geometry or material information, choose `request-input`.
-- If the screenshot matches the pass acceptance criteria and does not hide future risk, choose `continue`.
-
-`continue` is allowed only when the global AI vision score meets `selfCorrectLoop.visualAcceptance.threshold`, normally `0.7`, and every critical semantic feature meets its own threshold. A numeric or pixel-difference script may help diagnose alignment, but it cannot approve the pass.
+Action selection and root-cause rules live only in `self-correction-loop.md`. This file owns capture, evidence packaging, and visual scoring order.
 
 ## AI Vision Scorecard
 
@@ -54,11 +55,11 @@ Score each applicable layer from `0` to `1`, then assign one overall score based
 - `materialSurface`: albedo, roughness, reflectance, normal/displacement, AO, local wear, tactile frequency.
 - `lightingCamera`: camera match, exposure, key/fill/rim balance, shadow/contact response, background.
 
-Do not hide a critical failed layer inside a high average. If a layer is essential to the current pass and remains visibly wrong, choose `refine-spec` or `refine-code` even when the arithmetic mean is above threshold.
+Do not hide a critical failed layer inside a high average. If a layer is essential to the current pass and remains visibly wrong, choose `refine-spec` or `refine-code` even when the arithmetic mean is above threshold; use one `refine-batch` when the complete fix spans both.
 
 ## Feature Tiers
 
-- `critical`: identity-defining, user-prioritized, visually salient, or high-risk subsystem. Must be visible in the full pair and pass independently.
+- `critical`: identity-defining, user-prioritized, visually salient, or high-risk subsystem. It must be visible and pass independently; face/hand targets must also bind their dedicated `viewIds`.
 - `important`: useful secondary subsystem. Review only suspicious items; the reviewed average must meet the configured threshold.
 - `detail`: micro detail. Record mismatch notes and defer to refinement unless the user promotes it.
 
@@ -66,16 +67,18 @@ Repeated parts should be one target when they form one recognizable system. For 
 
 ## Evidence Format
 
-Record screenshot evidence with:
+Record each item in `evidence.views` with:
 
-- `referenceScreenshot`: source image, crop, or marked-up reference path.
+- `viewId`: the required view name.
+- `referenceImage`: source image, crop, or marked-up reference path.
 - `renderScreenshot`: browser-rendered screenshot path.
 - `comparisonImage`: side-by-side evidence image reviewed by AI vision.
-- `cameraView`: named viewpoint such as `front`, `three-quarter`, `side`, `top`, or `close-up-material`.
-- `notes`: concise mismatch summary using 3D graphics terms.
+
+Record review-level fields separately:
+
 - `aiVisionScore`: overall score from `0` to `1`.
 - `layerScores`: per-layer scores from the scorecard.
 - `aiVisionNotes`: concrete matched features, mismatches, root causes, and next correction.
-- `featureReviews`: feature ID, score, visibility in the shared pair, and focused notes.
+- `featureReviews`: feature ID, score, visibility in the contact sheet, focused notes, and `viewIds` for targets that require dedicated evidence.
 
 Never use screenshots as decoration only. They are the ground truth for the self-correction loop.

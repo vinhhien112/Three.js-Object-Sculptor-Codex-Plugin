@@ -5,12 +5,33 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from visual_feature_gate import feature_gate_failures, feature_review_policy
+from visual_feature_gate import feature_review_policy
+from sculpt_contract import (
+    COMPONENT_TYPES,
+    CURRENT_SCHEMA_VERSION,
+    adaptive_hypothesis_views,
+    component_type,
+    load_spec_file,
+    parse_schema_version,
+    pass_order as canonical_pass_order,
+    pipeline_status,
+    review_failures,
+    schema_version_at_least,
+)
+from sculpt_pass_orchestrator import material_gaps, pass_specific_gaps, surface_gaps
+from sculpt_geometry import (
+    VALID_PRIMITIVES,  # compatibility re-export for existing script consumers
+    validate_geometry_component,
+    validate_repetition_systems,
+    validate_surface_topology_plan,
+)
+from sculpt_specialized_regions import validate_specialized_regions
 
 
 REQUIRED_TOP_LEVEL = {
@@ -23,35 +44,29 @@ REQUIRED_TOP_LEVEL = {
     "proceduralStrategy": list,
 }
 VALID_SUITABILITY = {"pass", "conditional", "reject"}
-VALID_PRIMITIVES = {
-    "box",
-    "sphere",
-    "ellipsoid",
-    "cylinder",
-    "cone",
-    "capsule",
-    "torus",
-    "tube",
-    "lathe",
-    "extrude",
-    "curve-sweep",
-    "plane-card",
-    "instanced-cluster",
-}
 VALID_COMPONENT_LEVELS = {"macro", "meso", "micro"}
-VALID_COMPLEXITY_TIERS = {"unassessed", "simple", "moderate", "complex", "ultra-complex"}
+VALID_COMPLEXITY_TIERS = {"unassessed", "simple", "moderate", "complex", "ultra", "ultra-complex"}
 TERMINOLOGY_LIST_FIELDS = {"geometryTerms", "materialTerms", "lightingTerms"}
-VALID_REVIEW_ACTIONS = {"continue", "refine-spec", "refine-code", "request-input", "stop"}
-VISUAL_PASS_IDS = {
-    "blockout",
-    "structural-pass",
-    "form-refinement",
-    "material-pass",
-    "surface-pass",
-    "lighting-pass",
-    "interaction-pass",
+VALID_REVIEW_ACTIONS = {
+    "continue",
+    "refine-spec",
+    "refine-code",
+    "refine-batch",
+    "request-input",
+    "stop",
 }
-VALID_PIPELINE_PASS_IDS = VISUAL_PASS_IDS | {"optimization-pass"}
+VALID_REVIEW_ROOT_CAUSES = {
+    "",
+    "camera-framing",
+    "spec",
+    "geometry",
+    "material",
+    "lighting",
+    "evidence",
+    "performance",
+    "mixed",
+}
+VALID_CORRECTION_ACTIONS = {"set", "scale", "translate", "rotate", "replace", "inspect"}
 ATTACHMENT_ROLES = {
     "appendage",
     "branch",
@@ -74,10 +89,87 @@ ATTACHMENT_ROLES = {
     "pipe",
 }
 ATTACHMENT_PRIMITIVES = {"cylinder", "cone", "capsule", "tube", "curve-sweep"}
+PASS_WARNING_KEYWORDS = {
+    "blockout": ("preSpecAssessment", "surfaceTopologyPlan", "silhouette", "featureReviewTargets"),
+    "structure": ("component", "attachment", "hierarchy", "qualityContract", "meso"),
+    "form": ("component", "attachment", "hierarchy", "qualityContract", "surfaceDetail", "micro"),
+    "lookdev": ("material", "lookDev", "lighting", "surface", "PBR", "texture"),
+    "interaction": ("action", "pivot", "socket", "collider"),
+    "optimization": ("performance", "FPS", "draw", "triangle"),
+}
+PASS_ALIASES = {
+    "structural-pass": "structure",
+    "form-refinement": "form",
+    "material-pass": "lookdev",
+    "surface-pass": "lookdev",
+    "lighting-pass": "lookdev",
+    "interaction-pass": "interaction",
+    "optimization-pass": "optimization",
+}
+
+SUPPORTED_SCHEMA_VERSIONS = {(2, 0, 0), (3, 0, 0), (3, 1, 0)}
+VALID_MATERIAL_PROFILES = frozenset(
+    {"standard", "cloth", "fiber", "glass", "liquid", "volume"}
+)
+PROFILE_UNIT_INTERVAL_FIELDS = (
+    "sheen",
+    "sheenRoughness",
+    "anisotropy",
+    "transmission",
+    "opacity",
+)
+PROFILE_NONNEGATIVE_FIELDS = ("thickness", "dispersion", "emissiveIntensity")
+PROFILE_HEX_COLOR_FIELDS = ("sheenColor", "attenuationColor", "emissive")
+PROFILE_BOOLEAN_FIELDS = ("alphaHash", "depthWrite", "forceSinglePass")
+SPECIAL_PRIMITIVE_PROFILES = {
+    "fiber-system": "fiber",
+    "volume-field": "volume",
+}
+HEX_COLOR_PATTERN = re.compile(r"^#[0-9A-Fa-f]{3}(?:[0-9A-Fa-f]{3})?$")
+EXECUTABLE_LOCAL_MATERIAL_TYPES = frozenset(
+    {
+        "dirt",
+        "dust",
+        "wear",
+        "stain",
+        "moss",
+        "patina",
+        "wetness",
+        "soot",
+        "scorch",
+        "fade",
+        "scratch",
+        "chip",
+    }
+)
+LOCAL_MATERIAL_METADATA_TYPES = frozenset({"material-map-evidence"})
+VALID_LOCAL_MATERIAL_MASK_PATTERNS = frozenset(
+    {"noise", "cavity", "edge", "vertical", "speckle", "streak"}
+)
+
+
+def schema_at_least(spec: dict[str, Any], minimum: str) -> bool:
+    """Use numeric schema comparison while keeping malformed specs reportable."""
+    try:
+        return schema_version_at_least(spec, minimum)
+    except ValueError:
+        return False
+
+
+def warning_applies_to_pass(warning: str, pass_id: str | None) -> bool:
+    if pass_id is None or not warning.startswith("quality:"):
+        return True
+    selected = PASS_ALIASES.get(pass_id, pass_id)
+    keywords = PASS_WARNING_KEYWORDS.get(selected)
+    return keywords is None or any(keyword.lower() in warning.lower() for keyword in keywords)
 
 
 def is_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
 
 
 def validate_unit_interval(value: Any, label: str, errors: list[str]) -> None:
@@ -86,20 +178,14 @@ def validate_unit_interval(value: Any, label: str, errors: list[str]) -> None:
 
 
 def load_spec(path: Path) -> dict[str, Any]:
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"invalid JSON: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ValueError("spec must be a JSON object")
-    return payload
+    return load_spec_file(path)
 
 
 def as_number_list(value: Any, length: int) -> bool:
     return (
         isinstance(value, list)
         and len(value) == length
-        and all(isinstance(item, (int, float)) for item in value)
+        and all(is_number(item) for item in value)
     )
 
 
@@ -245,6 +331,75 @@ def validate_evidence(spec: dict[str, Any], errors: list[str], warnings: list[st
     return refs
 
 
+def validate_view_hypothesis_policy(
+    spec: dict[str, Any], errors: list[str], warnings: list[str]
+) -> None:
+    policy = spec.get("viewHypothesisPolicy")
+    if policy is None:
+        if has_non_empty_detail(spec.get("sourceImage")):
+            warnings.append(
+                "quality: source image has no viewHypothesisPolicy; front-only geometry cannot be vetoed reliably"
+            )
+        return
+    if not isinstance(policy, dict):
+        errors.append("viewHypothesisPolicy must be an object")
+        return
+    if not isinstance(policy.get("enabled"), bool):
+        errors.append("viewHypothesisPolicy.enabled must be boolean")
+    elif has_non_empty_detail(spec.get("sourceImage")) and policy.get("enabled") is not True:
+        errors.append("viewHypothesisPolicy.enabled must be true when sourceImage is present")
+    elif not has_non_empty_detail(spec.get("sourceImage")) and policy.get("enabled") is True:
+        errors.append("viewHypothesisPolicy cannot be enabled without sourceImage")
+    if policy.get("generator") != "built-in-imagegen":
+        errors.append("viewHypothesisPolicy.generator must be 'built-in-imagegen'")
+    if not isinstance(policy.get("promptVersion"), str) or not policy["promptVersion"].strip():
+        errors.append("viewHypothesisPolicy.promptVersion is required")
+    views = policy.get("requiredViews")
+    if not isinstance(views, list) or not views or not all(
+        isinstance(item, str) and item in {"three-quarter", "side", "back"}
+        for item in views
+    ):
+        errors.append(
+            "viewHypothesisPolicy.requiredViews must contain three-quarter, side, or back"
+        )
+    elif len(set(views)) != len(views):
+        errors.append("viewHypothesisPolicy.requiredViews contains duplicates")
+    else:
+        assessment = spec.get("preSpecAssessment")
+        complexity = assessment.get("complexity") if isinstance(assessment, dict) else None
+        tier = complexity.get("tier") if isinstance(complexity, dict) else "moderate"
+        minimum = set(
+            adaptive_hypothesis_views(
+                str(tier),
+                str(spec.get("qualityProfile") or "balanced"),
+            )
+        )
+        missing = minimum - set(views)
+        if missing:
+            errors.append(
+                "viewHypothesisPolicy.requiredViews weakens the adaptive minimum: "
+                + ", ".join(sorted(missing))
+            )
+    if policy.get("allowedUse") != "planning-veto":
+        errors.append("viewHypothesisPolicy.allowedUse must be 'planning-veto'")
+    if policy.get("acceptanceAuthority") is not False:
+        errors.append("viewHypothesisPolicy.acceptanceAuthority must be false")
+    manifest_path = policy.get("manifestPath")
+    manifest_hash = policy.get("manifestSha256")
+    cache_key = policy.get("cacheKey")
+    if any(value for value in (manifest_path, manifest_hash, cache_key)) and not all(
+        isinstance(value, str) and value.strip()
+        for value in (manifest_path, manifest_hash, cache_key)
+    ):
+        errors.append(
+            "viewHypothesisPolicy manifestPath, manifestSha256, and cacheKey must be recorded together"
+        )
+    if isinstance(manifest_hash, str) and manifest_hash and len(manifest_hash) != 64:
+        errors.append("viewHypothesisPolicy.manifestSha256 must be a SHA-256 digest")
+    if isinstance(cache_key, str) and cache_key and len(cache_key) != 64:
+        errors.append("viewHypothesisPolicy.cacheKey must be a SHA-256 digest")
+
+
 def validate_material_scalar_or_layer(value: Any, label: str, errors: list[str]) -> None:
     if value is None:
         return
@@ -259,6 +414,140 @@ def validate_material_scalar_or_layer(value: Any, label: str, errors: list[str])
     variation = value.get("variation")
     if variation is not None and not is_number(variation):
         errors.append(f"{label}.variation must be numeric")
+
+
+def validate_material_profile(
+    material_id: str,
+    material: dict[str, Any],
+    errors: list[str],
+) -> None:
+    """Validate optional special-surface fields without changing legacy materials."""
+
+    if "materialProfile" not in material:
+        return
+    profile = material.get("materialProfile")
+    if not isinstance(profile, str) or profile not in VALID_MATERIAL_PROFILES:
+        errors.append(
+            f"material {material_id!r} materialProfile must be one of: "
+            + ", ".join(sorted(VALID_MATERIAL_PROFILES))
+        )
+
+    def profile_number(
+        value: Any,
+        *,
+        layer_keys: tuple[str, ...] = (),
+    ) -> float | None:
+        if is_number(value):
+            return float(value)
+        if layer_keys and isinstance(value, dict):
+            for key in layer_keys:
+                nested = value.get(key)
+                if is_number(nested):
+                    return float(nested)
+        return None
+
+    for field in PROFILE_UNIT_INTERVAL_FIELDS:
+        if field not in material:
+            continue
+        value = profile_number(material[field], layer_keys=("base", "amount"))
+        if value is None or not 0 <= value <= 1:
+            errors.append(
+                f"material {material_id!r} {field} must be a finite number from 0 to 1 "
+                "or a layer object with base/amount in that range"
+            )
+
+    rotation = material.get("anisotropyRotation")
+    if "anisotropyRotation" in material and profile_number(
+        rotation, layer_keys=("base", "angle")
+    ) is None:
+        errors.append(
+            f"material {material_id!r} anisotropyRotation must be a finite number "
+            "or a layer object with finite base/angle"
+        )
+
+    ior = material.get("ior")
+    parsed_ior = profile_number(ior, layer_keys=("base",))
+    if "ior" in material and (parsed_ior is None or not 1 <= parsed_ior <= 2.333):
+        errors.append(
+            f"material {material_id!r} ior must be from 1 to 2.333 "
+            "or a layer object with base in that range"
+        )
+
+    for field in PROFILE_NONNEGATIVE_FIELDS:
+        if field not in material:
+            continue
+        layered = field in {"thickness", "dispersion", "emissiveIntensity"}
+        value = profile_number(
+            material[field],
+            layer_keys=("base", "amount") if layered else (),
+        )
+        if value is None or value < 0:
+            layer_note = " or a layer object with non-negative base/amount" if layered else ""
+            errors.append(
+                f"material {material_id!r} {field} must be a non-negative finite number"
+                + layer_note
+            )
+
+    attenuation_distance = material.get("attenuationDistance")
+    parsed_attenuation_distance = profile_number(
+        attenuation_distance,
+        layer_keys=("base",),
+    )
+    if "attenuationDistance" in material and (
+        parsed_attenuation_distance is None or parsed_attenuation_distance <= 0
+    ):
+        errors.append(
+            f"material {material_id!r} attenuationDistance must be a positive finite number "
+            "or a layer object with a positive base"
+        )
+
+    for field in PROFILE_HEX_COLOR_FIELDS:
+        if field not in material:
+            continue
+        value = material[field]
+        if not isinstance(value, str) or HEX_COLOR_PATTERN.fullmatch(value) is None:
+            errors.append(
+                f"material {material_id!r} {field} must be #RGB or #RRGGBB"
+            )
+
+    for field in PROFILE_BOOLEAN_FIELDS:
+        if field in material and not isinstance(material[field], bool):
+            errors.append(f"material {material_id!r} {field} must be boolean")
+
+
+def validate_special_material_compatibility(
+    spec: dict[str, Any],
+    warnings: list[str],
+) -> None:
+    """Keep form generation valid while routing appearance mismatches to lookdev."""
+
+    materials = {
+        item.get("id"): item
+        for item in spec.get("materials", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    for component in spec.get("componentTree", []):
+        if not isinstance(component, dict):
+            continue
+        primitive = component.get("primitive")
+        expected = SPECIAL_PRIMITIVE_PROFILES.get(primitive)
+        if expected is None:
+            continue
+        material_id = component.get("material")
+        material = materials.get(material_id)
+        if not isinstance(material, dict):
+            continue
+        actual = material.get("materialProfile", "standard")
+        if (
+            isinstance(actual, str)
+            and actual in VALID_MATERIAL_PROFILES
+            and actual != expected
+        ):
+            component_id = str(component.get("id") or "(unnamed)")
+            warnings.append(
+                f"quality: material {material_id!r} assigned to {primitive} {component_id!r} "
+                f"should use materialProfile {expected!r} during lookdev"
+            )
 
 
 def validate_reference_pbr_map(value: Any, label: str, errors: list[str]) -> None:
@@ -278,6 +567,9 @@ def validate_reference_pbr_map(value: Any, label: str, errors: list[str]) -> Non
     channel = value.get("channel")
     if channel is not None and not isinstance(channel, str):
         errors.append(f"{label}.channel must be a string")
+    tile_safe = value.get("tileSafe")
+    if tile_safe is not None and not isinstance(tile_safe, bool):
+        errors.append(f"{label}.tileSafe must be boolean")
 
 
 def validate_reference_pbr(material_id: str, value: Any, errors: list[str], warnings: list[str]) -> None:
@@ -293,7 +585,10 @@ def validate_reference_pbr(material_id: str, value: Any, errors: list[str], warn
     usable = value.get("usable")
     if usable is not None and not isinstance(usable, bool):
         errors.append(f"material {material_id!r} referencePbr.usable must be boolean")
-    for field in ("confidence", "estimatedFidelity", "targetThreshold"):
+    crop_confirmed = value.get("materialCropConfirmed")
+    if crop_confirmed is not None and not isinstance(crop_confirmed, bool):
+        errors.append(f"material {material_id!r} referencePbr.materialCropConfirmed must be boolean")
+    for field in ("confidence", "extractionSuitability", "estimatedFidelity", "targetThreshold"):
         item = value.get(field)
         if item is not None:
             validate_unit_interval(item, f"material {material_id!r} referencePbr.{field}", errors)
@@ -310,6 +605,161 @@ def validate_reference_pbr(material_id: str, value: Any, errors: list[str], warn
             warnings.append(f"quality: material {material_id!r} referencePbr.maps missing {channel}")
         else:
             validate_reference_pbr_map(maps[channel], f"material {material_id!r} referencePbr.maps.{channel}", errors)
+
+
+def _layer_value(value: Any, keys: tuple[str, ...] = ("base", "amount")) -> float | None:
+    if is_number(value):
+        return float(value)
+    if isinstance(value, dict):
+        for key in keys:
+            nested = value.get(key)
+            if is_number(nested):
+                return float(nested)
+    return None
+
+
+def validate_local_material_override(
+    material_id: str,
+    index: int,
+    value: Any,
+    errors: list[str],
+) -> None:
+    label = f"material {material_id!r} localOverrides[{index}]"
+    if not isinstance(value, dict):
+        errors.append(f"{label} must be an object")
+        return
+    override_id = value.get("id")
+    if not isinstance(override_id, str) or not override_id.strip():
+        errors.append(f"{label}.id is required")
+    layer_type = value.get("type")
+    supported_types = EXECUTABLE_LOCAL_MATERIAL_TYPES | LOCAL_MATERIAL_METADATA_TYPES
+    if not isinstance(layer_type, str) or layer_type not in supported_types:
+        errors.append(
+            f"{label}.type must be one of: " + ", ".join(sorted(supported_types))
+        )
+        return
+    evidence_refs = value.get("evidenceRefs")
+    if not (
+        isinstance(evidence_refs, list)
+        and evidence_refs
+        and all(isinstance(item, str) and item.strip() for item in evidence_refs)
+    ):
+        errors.append(f"{label}.evidenceRefs must contain at least one evidence id")
+    if layer_type in LOCAL_MATERIAL_METADATA_TYPES:
+        return
+    amount = _layer_value(value.get("amount"))
+    if amount is None or not 0 < amount <= 1:
+        errors.append(f"{label}.amount must be greater than 0 and at most 1")
+    color = value.get("color")
+    if not isinstance(color, str) or HEX_COLOR_PATTERN.fullmatch(color) is None:
+        errors.append(f"{label}.color must be #RGB or #RRGGBB")
+    for field in ("roughnessDelta", "metalnessDelta"):
+        field_value = _layer_value(value.get(field))
+        if field_value is not None and not -1 <= field_value <= 1:
+            errors.append(f"{label}.{field} must be from -1 to 1")
+    height_delta = _layer_value(value.get("heightDelta"))
+    if height_delta is not None and not -0.25 <= height_delta <= 0.25:
+        errors.append(f"{label}.heightDelta must be from -0.25 to 0.25")
+    mask = value.get("mask")
+    if not isinstance(mask, dict):
+        errors.append(f"{label}.mask must be an executable mask object")
+        return
+    pattern = mask.get("pattern")
+    if not isinstance(pattern, str) or pattern not in VALID_LOCAL_MATERIAL_MASK_PATTERNS:
+        errors.append(
+            f"{label}.mask.pattern must be one of: "
+            + ", ".join(sorted(VALID_LOCAL_MATERIAL_MASK_PATTERNS))
+        )
+    frequency = mask.get("frequency")
+    if frequency is not None and (not is_number(frequency) or frequency <= 0):
+        errors.append(f"{label}.mask.frequency must be a positive number")
+    threshold = mask.get("threshold")
+    if threshold is not None:
+        validate_unit_interval(threshold, f"{label}.mask.threshold", errors)
+    contrast = mask.get("contrast")
+    if contrast is not None and (not is_number(contrast) or contrast <= 0):
+        errors.append(f"{label}.mask.contrast must be a positive number")
+    for field in ("cavityBias", "edgeBias"):
+        if field in mask:
+            validate_unit_interval(mask[field], f"{label}.mask.{field}", errors)
+    vertical_bias = mask.get("verticalBias")
+    if vertical_bias is not None and (
+        not is_number(vertical_bias) or not -1 <= float(vertical_bias) <= 1
+    ):
+        errors.append(f"{label}.mask.verticalBias must be from -1 to 1")
+    uv_center = mask.get("uvCenter")
+    uv_scale = mask.get("uvScale")
+    if (uv_center is None) != (uv_scale is None):
+        errors.append(f"{label}.mask.uvCenter and uvScale must be provided together")
+    if uv_center is not None and not (
+        isinstance(uv_center, list)
+        and len(uv_center) == 2
+        and all(is_number(item) and 0 <= item <= 1 for item in uv_center)
+    ):
+        errors.append(f"{label}.mask.uvCenter must contain two numbers from 0 to 1")
+    if uv_scale is not None and not (
+        isinstance(uv_scale, list)
+        and len(uv_scale) == 2
+        and all(is_number(item) and item > 0 for item in uv_scale)
+    ):
+        errors.append(f"{label}.mask.uvScale must contain two positive numbers")
+    feather = mask.get("feather")
+    if feather is not None and (
+        not is_number(feather) or not 0 < float(feather) <= 1
+    ):
+        errors.append(f"{label}.mask.feather must be greater than 0 and at most 1")
+    seed = mask.get("seed")
+    if seed is not None and (not isinstance(seed, int) or isinstance(seed, bool)):
+        errors.append(f"{label}.mask.seed must be an integer")
+
+
+def validate_material_surface_response(
+    material_id: str,
+    material: dict[str, Any],
+    errors: list[str],
+) -> None:
+    specular_intensity = _layer_value(material.get("specularIntensity"))
+    if "specularIntensity" in material and (
+        specular_intensity is None or not 0 <= specular_intensity <= 1
+    ):
+        errors.append(
+            f"material {material_id!r} specularIntensity must be from 0 to 1 "
+            "or a layer object with base/amount in that range"
+        )
+    specular_color = material.get("specularColor")
+    if "specularColor" in material and (
+        not isinstance(specular_color, str)
+        or HEX_COLOR_PATTERN.fullmatch(specular_color) is None
+    ):
+        errors.append(f"material {material_id!r} specularColor must be #RGB or #RRGGBB")
+    env_intensity = _layer_value(material.get("envMapIntensity"))
+    if "envMapIntensity" in material and (
+        env_intensity is None or env_intensity < 0
+    ):
+        errors.append(
+            f"material {material_id!r} envMapIntensity must be non-negative "
+            "or a layer object with non-negative base/amount"
+        )
+    dirt = material.get("dirt")
+    if isinstance(dirt, dict):
+        for field in ("amount", "cavityBias"):
+            if field in dirt:
+                parsed = _layer_value(dirt[field])
+                if parsed is None or not 0 <= parsed <= 1:
+                    errors.append(f"material {material_id!r} dirt.{field} must be from 0 to 1")
+        dirt_color = dirt.get("color")
+        if dirt_color is not None and (
+            not isinstance(dirt_color, str) or HEX_COLOR_PATTERN.fullmatch(dirt_color) is None
+        ):
+            errors.append(f"material {material_id!r} dirt.color must be #RGB or #RRGGBB")
+    wear = material.get("wear")
+    if isinstance(wear, dict):
+        edge_wear = _layer_value(wear.get("edgeWear"))
+        if "edgeWear" in wear and (edge_wear is None or not 0 <= edge_wear <= 1):
+            errors.append(f"material {material_id!r} wear.edgeWear must be from 0 to 1")
+        for field in ("scratches", "chips"):
+            if field in wear and not isinstance(wear[field], list):
+                errors.append(f"material {material_id!r} wear.{field} must be an array")
 
 
 def validate_materials(spec: dict[str, Any], errors: list[str], warnings: list[str]) -> set[str]:
@@ -358,6 +808,16 @@ def validate_materials(spec: dict[str, Any], errors: list[str], warnings: list[s
                 mode = projection.get("mode")
                 if mode is not None and not isinstance(mode, str):
                     errors.append(f"material {material_id!r} textureProjection.mode must be a string")
+                elif isinstance(mode, str) and mode not in {
+                    "uv",
+                    "planar",
+                    "cylindrical",
+                    "spherical",
+                }:
+                    warnings.append(
+                        f"quality: material {material_id!r} textureProjection.mode {mode!r} "
+                        "is not emitted directly; provide UV-authored geometry or use a supported mode"
+                    )
                 repeat = projection.get("repeat")
                 if repeat is not None and not (
                     isinstance(repeat, list)
@@ -399,9 +859,20 @@ def validate_materials(spec: dict[str, Any], errors: list[str], warnings: list[s
         local_overrides = material.get("localOverrides", [])
         if local_overrides is not None and not isinstance(local_overrides, list):
             errors.append(f"material {material_id!r} localOverrides must be an array")
+        elif isinstance(local_overrides, list):
+            if len(local_overrides) > 14:
+                errors.append(
+                    f"material {material_id!r} localOverrides supports at most 14 layers"
+                )
+            for override_index, override in enumerate(local_overrides):
+                validate_local_material_override(
+                    material_id, override_index, override, errors
+                )
         shader_notes = material.get("shaderNotes")
         if shader_notes is not None:
             validate_string_array(shader_notes, f"material {material_id!r} shaderNotes", errors)
+        validate_material_profile(material_id, material, errors)
+        validate_material_surface_response(material_id, material, errors)
         validate_reference_pbr(material_id, material.get("referencePbr"), errors, warnings)
     if not material_ids:
         errors.append("at least one material is required")
@@ -415,8 +886,10 @@ def validate_dimensions(component_id: str, dimensions: Any, errors: list[str]) -
         errors.append(f"component {component_id!r} dimensions must be an object")
         return
     for field in ("width", "height", "depth", "radius", "length"):
-        if field in dimensions and not is_number(dimensions[field]):
-            errors.append(f"component {component_id!r} dimensions.{field} must be numeric")
+        if field in dimensions and (
+            not is_number(dimensions[field]) or float(dimensions[field]) <= 0
+        ):
+            errors.append(f"component {component_id!r} dimensions.{field} must be a positive finite number")
     confidence = dimensions.get("confidence")
     if confidence is not None:
         validate_unit_interval(confidence, f"component {component_id!r} dimensions.confidence", errors)
@@ -459,9 +932,18 @@ def validate_bool_object(value: Any, label: str, errors: list[str]) -> None:
             errors.append(f"{label}.{key} must be boolean")
 
 
-def validate_action_profile(component_id: str, profile: Any, errors: list[str], warnings: list[str]) -> None:
+def validate_action_profile(
+    component_id: str,
+    profile: Any,
+    errors: list[str],
+    warnings: list[str],
+    required: bool,
+) -> None:
     if profile is None:
-        warnings.append(f"component {component_id!r} is missing actionProfile; future animation/destruction may require refactor")
+        if required:
+            warnings.append(
+                f"quality: component {component_id!r} is missing actionProfile required by intended use"
+            )
         return
     if not isinstance(profile, dict):
         errors.append(f"component {component_id!r} actionProfile must be an object")
@@ -535,7 +1017,7 @@ def validate_action_profile(component_id: str, profile: Any, errors: list[str], 
 
 
 def component_requires_attachment(component: dict[str, Any]) -> bool:
-    if not component.get("parent"):
+    if component_type(component) == "assembly" or not component.get("parent"):
         return False
     role = str(component.get("role") or "").lower()
     name = str(component.get("name") or component.get("id") or "").lower()
@@ -616,6 +1098,88 @@ def validate_string_array(value: Any, label: str, errors: list[str]) -> None:
         errors.append(f"{label} must be an array of strings")
 
 
+EMITTED_LOCAL_PATH_FEATURES = {"seam", "seam-line", "raised-ridge", "fabric-stitch"}
+EMITTED_LOCAL_POINT_FEATURES = {"button", "rivet", "screw"}
+
+
+def validate_local_features(
+    component_id: str,
+    value: Any,
+    material_ids: set[str],
+    errors: list[str],
+) -> None:
+    if value is None:
+        return
+    label = f"component {component_id!r} localFeatures"
+    if not isinstance(value, list):
+        errors.append(f"{label} must be an array")
+        return
+    seen: set[str] = set()
+    for index, feature in enumerate(value):
+        feature_label = f"{label}[{index}]"
+        if not isinstance(feature, dict):
+            errors.append(f"{feature_label} must be an object")
+            continue
+        feature_id = feature.get("id")
+        if not isinstance(feature_id, str) or not feature_id.strip():
+            errors.append(f"{feature_label}.id is required")
+        elif feature_id in seen:
+            errors.append(f"{label} has duplicate id {feature_id!r}")
+        else:
+            seen.add(feature_id)
+        feature_type = feature.get("type")
+        supported = EMITTED_LOCAL_PATH_FEATURES | EMITTED_LOCAL_POINT_FEATURES | {"decal"}
+        if feature_type not in supported:
+            errors.append(
+                f"{feature_label}.type must be one of: " + ", ".join(sorted(supported))
+            )
+            continue
+        material = feature.get("material")
+        if material is not None and (
+            not isinstance(material, str) or material not in material_ids
+        ):
+            errors.append(f"{feature_label}.material references unknown material {material!r}")
+        for field in ("position", "rotation", "scale"):
+            if field in feature and not as_number_list(feature[field], 3):
+                errors.append(f"{feature_label}.{field} must be [number, number, number]")
+        if feature_type in EMITTED_LOCAL_PATH_FEATURES:
+            path = feature.get("path")
+            if not isinstance(path, list) or len(path) < 2:
+                errors.append(f"{feature_label}.path must contain at least two local 3D points")
+            elif len(path) > 256:
+                errors.append(f"{feature_label}.path must contain at most 256 points")
+            else:
+                for point_index, point in enumerate(path):
+                    if not as_number_list(point, 3):
+                        errors.append(
+                            f"{feature_label}.path[{point_index}] must be [number, number, number]"
+                        )
+            radius = feature.get("radius")
+            if not is_number(radius) or float(radius) <= 0:
+                errors.append(f"{feature_label}.radius must be a positive finite number")
+            segments = feature.get("segments")
+            if segments is not None and (
+                not isinstance(segments, int)
+                or isinstance(segments, bool)
+                or not 2 <= segments <= 512
+            ):
+                errors.append(f"{feature_label}.segments must be an integer from 2 to 512")
+        elif feature_type in EMITTED_LOCAL_POINT_FEATURES:
+            if not as_number_list(feature.get("position"), 3):
+                errors.append(f"{feature_label}.position must be [number, number, number]")
+            radius = feature.get("radius")
+            if not is_number(radius) or float(radius) <= 0:
+                errors.append(f"{feature_label}.radius must be a positive finite number")
+        else:
+            size = feature.get("size")
+            if (
+                not isinstance(size, list)
+                or len(size) != 2
+                or not all(is_number(item) and float(item) > 0 for item in size)
+            ):
+                errors.append(f"{feature_label}.size must be two positive numbers")
+
+
 def validate_components(
     spec: dict[str, Any],
     material_ids: set[str],
@@ -624,8 +1188,18 @@ def validate_components(
     warnings: list[str],
 ) -> None:
     components = spec.get("componentTree", [])
+    component_lookup = {
+        str(item["id"]): item
+        for item in components
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and item["id"].strip()
+    }
     ids: set[str] = set()
     parent_refs: list[tuple[str, str]] = []
+    readiness = spec.get("actionReadiness")
+    action_profile_required = isinstance(readiness, dict) and readiness.get("enabled") is True
+    repetition_systems = spec.get("repetitionSystems", [])
     for index, component in enumerate(components):
         if not isinstance(component, dict):
             errors.append(f"componentTree[{index}] must be an object")
@@ -637,10 +1211,46 @@ def validate_components(
         if component_id in ids:
             errors.append(f"duplicate component id {component_id!r}")
         ids.add(component_id)
+        kind = component_type(component)
+        if schema_at_least(spec, CURRENT_SCHEMA_VERSION):
+            if "componentType" not in component:
+                errors.append(f"component {component_id!r} missing core field 'componentType'")
+            if kind not in COMPONENT_TYPES:
+                errors.append(
+                    f"component {component_id!r} componentType {kind!r} must be one of: "
+                    + ", ".join(sorted(COMPONENT_TYPES))
+                )
+        if schema_at_least(spec, "3.0"):
+            required_fields = ("transform",) if kind == "assembly" else (
+                "primitive",
+                "dimensions",
+                "transform",
+                "material",
+            )
+            for required_field in required_fields:
+                if required_field not in component:
+                    errors.append(
+                        f"component {component_id!r} missing core field {required_field!r}"
+                    )
         primitive = component.get("primitive")
-        if primitive not in VALID_PRIMITIVES:
-            errors.append(
-                f"component {component_id!r} primitive must be one of: {', '.join(sorted(VALID_PRIMITIVES))}"
+        if kind == "assembly" and schema_at_least(spec, CURRENT_SCHEMA_VERSION):
+            ignored_geometry = [
+                field
+                for field in ("primitive", "dimensions", "material", "geometryDescriptor")
+                if field in component
+            ]
+            if ignored_geometry:
+                errors.append(
+                    f"assembly {component_id!r} must not define geometry-only fields: "
+                    + ", ".join(ignored_geometry)
+                )
+        else:
+            errors.extend(
+                validate_geometry_component(
+                    component,
+                    repetition_systems,
+                    component_lookup,
+                )
             )
         level = component.get("level")
         if level is not None and level not in VALID_COMPONENT_LEVELS:
@@ -658,7 +1268,8 @@ def validate_components(
         material = component.get("material")
         if material and material not in material_ids:
             errors.append(f"component {component_id!r} references unknown material {material!r}")
-        validate_geometry_descriptor(component_id, component.get("geometryDescriptor"), errors)
+        if kind != "assembly":
+            validate_geometry_descriptor(component_id, component.get("geometryDescriptor"), errors)
         material_layers = component.get("materialLayers")
         if material_layers is not None:
             validate_string_array(material_layers, f"component {component_id!r} materialLayers", errors)
@@ -668,7 +1279,8 @@ def validate_components(
                         errors.append(
                             f"component {component_id!r} materialLayers references unknown material {material_layer!r}"
                         )
-        validate_dimensions(component_id, component.get("dimensions"), errors)
+        if kind != "assembly":
+            validate_dimensions(component_id, component.get("dimensions"), errors)
         transform = component.get("transform", {})
         if transform is not None and not isinstance(transform, dict):
             errors.append(f"component {component_id!r} transform must be an object")
@@ -676,7 +1288,13 @@ def validate_components(
             for field in ("position", "rotation", "scale"):
                 if field in transform and not as_number_list(transform[field], 3):
                     errors.append(f"component {component_id!r} transform.{field} must be [number, number, number]")
-        validate_action_profile(component_id, component.get("actionProfile"), errors, warnings)
+        validate_action_profile(
+            component_id,
+            component.get("actionProfile"),
+            errors,
+            warnings,
+            action_profile_required,
+        )
         validate_attachment(
             component_id,
             parent if isinstance(parent, str) else None,
@@ -685,10 +1303,16 @@ def validate_components(
             errors,
             warnings,
         )
-        for field in ("deformations", "joints", "seams", "localFeatures"):
+        for field in ("deformations", "joints", "seams"):
             value = component.get(field)
             if value is not None and not isinstance(value, list):
                 errors.append(f"component {component_id!r} {field} must be an array")
+        validate_local_features(
+            component_id,
+            component.get("localFeatures"),
+            material_ids,
+            errors,
+        )
         surface = component.get("surfaceDetail")
         if surface is not None:
             if not isinstance(surface, dict):
@@ -707,10 +1331,71 @@ def validate_components(
     for component_id, parent in parent_refs:
         if parent not in ids:
             errors.append(f"component {component_id!r} references missing parent {parent!r}")
+    parent_by_id = {component_id: parent for component_id, parent in parent_refs if parent in ids}
+    for component_id in ids:
+        chain: list[str] = []
+        current = component_id
+        while current in parent_by_id:
+            if current in chain:
+                cycle = chain[chain.index(current) :] + [current]
+                message = "component parent cycle: " + " -> ".join(cycle)
+                if message not in errors:
+                    errors.append(message)
+                break
+            chain.append(current)
+            current = parent_by_id[current]
     if not ids:
         errors.append("at least one component is required")
-    if len(ids) == 1:
+    root_ids = [
+        str(component.get("id"))
+        for component in components
+        if isinstance(component, dict)
+        and isinstance(component.get("id"), str)
+        and component.get("parent") is None
+    ]
+    if ids and len(root_ids) != 1:
+        errors.append(f"componentTree must have exactly one root component; found {len(root_ids)}")
+    if isinstance(repetition_systems, list):
+        for index, system in enumerate(repetition_systems):
+            if not isinstance(system, dict):
+                continue
+            component_ref = system.get("componentRef")
+            if component_ref is not None and (
+                not isinstance(component_ref, str) or component_ref not in ids
+            ):
+                errors.append(
+                    f"repetitionSystems[{index}].componentRef references unknown component "
+                    f"{component_ref!r}"
+                )
+    assessment = spec.get("preSpecAssessment")
+    complexity_block = assessment.get("complexity") if isinstance(assessment, dict) else None
+    complexity = complexity_block.get("tier") if isinstance(complexity_block, dict) else None
+    if len(ids) == 1 and complexity != "simple":
         warnings.append("only one component found; this is likely still blockout quality")
+    if schema_at_least(spec, CURRENT_SCHEMA_VERSION):
+        reviewed_refs: set[str] = set()
+        for collection_name in ("featureReviewTargets", "buildPasses"):
+            for item in spec.get(collection_name, []):
+                if not isinstance(item, dict) or not isinstance(item.get("componentRefs"), list):
+                    continue
+                reviewed_refs.update(
+                    value for value in item["componentRefs"] if isinstance(value, str)
+                )
+        for component in components:
+            if not isinstance(component, dict) or component_type(component) != "assembly":
+                continue
+            assembly_id = component.get("id")
+            importance = component.get("importance", 0)
+            if (
+                isinstance(assembly_id, str)
+                and is_number(importance)
+                and float(importance) >= 0.75
+                and assembly_id not in reviewed_refs
+            ):
+                warnings.append(
+                    f"quality: important assembly {assembly_id!r} is not covered by any "
+                    "build pass or semantic feature review target"
+                )
 
 
 def validate_quality_targets(spec: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
@@ -726,6 +1411,37 @@ def validate_quality_targets(spec: dict[str, Any], errors: list[str], warnings: 
         validate_unit_interval(target_fidelity, "qualityTargets.targetFidelity", errors)
     for field in ("mustMatch", "niceToHave", "reviewViewpoints"):
         validate_string_array(targets.get(field), f"qualityTargets.{field}", errors)
+    diagnostics = targets.get("diagnosticTargets")
+    if diagnostics is not None:
+        if not isinstance(diagnostics, dict):
+            errors.append("qualityTargets.diagnosticTargets must be an object")
+        else:
+            for field in (
+                "silhouetteIou",
+                "maximumCentroidDelta",
+                "maximumAspectRatioDelta",
+                "minimumDetailEnergyRatio",
+                "minimumEdgeDensityRatio",
+                "minimumHistogramIntersection",
+                "maximumMeanColorDelta",
+                "minimumHighlightCoverageRatio",
+                "minimumHighlightEnergyRatio",
+            ):
+                if field in diagnostics:
+                    validate_unit_interval(
+                        diagnostics[field],
+                        f"qualityTargets.diagnosticTargets.{field}",
+                        errors,
+                    )
+            authority = diagnostics.get("acceptanceAuthority")
+            if authority is not None and not isinstance(authority, bool):
+                errors.append(
+                    "qualityTargets.diagnosticTargets.acceptanceAuthority must be boolean"
+                )
+            elif authority is True:
+                warnings.append(
+                    "quality: diagnostic image metrics cannot be the visual acceptance authority"
+                )
 
 
 def validate_quality_contract(spec: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
@@ -790,7 +1506,11 @@ def validate_quality_depth(spec: dict[str, Any], errors: list[str], warnings: li
     if not isinstance(contract, dict) or not isinstance(contract.get("minimumSpecDepth"), dict):
         return
     minimums = contract["minimumSpecDepth"]
-    components = [item for item in spec.get("componentTree", []) if isinstance(item, dict)]
+    components = [
+        item
+        for item in spec.get("componentTree", [])
+        if isinstance(item, dict) and component_type(item) != "assembly"
+    ]
     level_counts = {
         "macroComponents": sum(1 for item in components if item.get("level") == "macro"),
         "mesoComponents": sum(1 for item in components if item.get("level") == "meso"),
@@ -858,11 +1578,26 @@ def validate_self_correct_loop(spec: dict[str, Any], errors: list[str], warnings
         reviewer = visual_acceptance.get("reviewer")
         if reviewer is not None and not isinstance(reviewer, str):
             errors.append("selfCorrectLoop.visualAcceptance.reviewer must be a string")
-        threshold = visual_acceptance.get("threshold")
-        if threshold is None:
-            warnings.append("quality: selfCorrectLoop.visualAcceptance.threshold is missing")
-        else:
-            validate_unit_interval(threshold, "selfCorrectLoop.visualAcceptance.threshold", errors)
+        target_fidelity = (
+            spec.get("qualityTargets", {}).get("targetFidelity")
+            if isinstance(spec.get("qualityTargets"), dict)
+            else None
+        )
+        for field in ("threshold", "minimumAiVisionScore"):
+            value = visual_acceptance.get(field)
+            if value is None:
+                warnings.append(f"quality: selfCorrectLoop.visualAcceptance.{field} is missing")
+                continue
+            validate_unit_interval(value, f"selfCorrectLoop.visualAcceptance.{field}", errors)
+            if (
+                is_number(value)
+                and is_number(target_fidelity)
+                and float(value) < float(target_fidelity)
+            ):
+                errors.append(
+                    f"selfCorrectLoop.visualAcceptance.{field} cannot be below "
+                    "qualityTargets.targetFidelity"
+                )
         for field in (
             "comparisonArtifactRequired",
             "layerScoresRequired",
@@ -973,6 +1708,41 @@ def validate_visual_evidence_item(item: Any, label: str, errors: list[str]) -> N
                     errors.append(f"{label}.layerScores.{key} must be a number from 0 to 1")
 
 
+def validate_fit_diagnostics(value: Any, label: str, errors: list[str]) -> None:
+    if value is None:
+        return
+    if not isinstance(value, dict):
+        errors.append(f"{label} must be an object")
+        return
+    if value.get("acceptanceAuthority") is not False:
+        errors.append(f"{label}.acceptanceAuthority must be false")
+    for field in (
+        "silhouetteIou",
+        "centroidDelta",
+        "aspectRatioDelta",
+        "normalizedContourDistance",
+    ):
+        if field in value:
+            validate_unit_interval(value[field], f"{label}.{field}", errors)
+    appearance = value.get("appearance")
+    if appearance is not None:
+        if not isinstance(appearance, dict):
+            errors.append(f"{label}.appearance must be an object")
+        else:
+            for field in (
+                "detailEnergyRatio",
+                "edgeDensityRatio",
+                "foregroundHistogramIntersection",
+                "foregroundMeanColorDelta",
+                "highlightCoverageRatio",
+                "highlightEnergyRatio",
+            ):
+                if field in appearance:
+                    validate_unit_interval(
+                        appearance[field], f"{label}.appearance.{field}", errors
+                    )
+
+
 def validate_feature_review_targets(
     spec: dict[str, Any],
     errors: list[str],
@@ -995,6 +1765,17 @@ def validate_feature_review_targets(
     ids: set[str] = set()
     critical_by_pass: dict[str, int] = {}
     important_by_pass: dict[str, int] = {}
+    known_passes = set(canonical_pass_order(spec))
+    known_components = {
+        item.get("id")
+        for item in spec.get("componentTree", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    known_evidence = {
+        item.get("id")
+        for item in spec.get("viewEvidence", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
     for index, target in enumerate(targets):
         label = f"featureReviewTargets[{index}]"
         if not isinstance(target, dict):
@@ -1015,13 +1796,29 @@ def validate_feature_review_targets(
         validate_string_array(target.get("passIds"), f"{label}.passIds", errors)
         validate_string_array(target.get("componentRefs"), f"{label}.componentRefs", errors)
         validate_string_array(target.get("evidenceRefs"), f"{label}.evidenceRefs", errors)
+        validate_string_array(target.get("reviewViewIds"), f"{label}.reviewViewIds", errors)
+        validate_string_array(target.get("criteria"), f"{label}.criteria", errors)
+        for pass_id in target.get("passIds", []) if isinstance(target.get("passIds"), list) else []:
+            if isinstance(pass_id, str) and pass_id not in known_passes:
+                errors.append(f"{label}.passIds references unknown pass {pass_id!r}")
+        for component_id in target.get("componentRefs", []) if isinstance(target.get("componentRefs"), list) else []:
+            if isinstance(component_id, str) and component_id not in known_components:
+                errors.append(f"{label}.componentRefs references unknown component {component_id!r}")
+        for evidence_id in target.get("evidenceRefs", []) if isinstance(target.get("evidenceRefs"), list) else []:
+            if isinstance(evidence_id, str) and evidence_id not in known_evidence:
+                errors.append(f"{label}.evidenceRefs references unknown evidence {evidence_id!r}")
+        for view_id in target.get("reviewViewIds", []) if isinstance(target.get("reviewViewIds"), list) else []:
+            if isinstance(view_id, str) and view_id not in known_evidence:
+                errors.append(f"{label}.reviewViewIds references unknown evidence {view_id!r}")
         minimum = target.get("minimumScore")
         if minimum is not None:
             validate_unit_interval(minimum, f"{label}.minimumScore", errors)
-        for field in ("mustPass",):
+        for field in ("mustPass", "requiresDedicatedEvidence"):
             value = target.get(field)
             if value is not None and not isinstance(value, bool):
                 errors.append(f"{label}.{field} must be boolean")
+        if target.get("requiresDedicatedEvidence") is True and not target.get("reviewViewIds"):
+            errors.append(f"{label}.reviewViewIds is required for dedicated evidence")
         if tier == "critical" or target.get("mustPass") is True:
             pass_ids = target.get("passIds", [])
             if isinstance(pass_ids, list):
@@ -1060,8 +1857,9 @@ def validate_feature_review_targets(
         "overall-silhouette",
         "primary-structure",
         "reference-material-system",
+        "reference-lookdev",
     }
-    if complexity in {"moderate", "complex", "ultra-complex"} and ids.issubset(starter_ids):
+    if complexity in {"moderate", "complex", "ultra", "ultra-complex"} and ids.issubset(starter_ids):
         warnings.append(
             "quality: replace generic starter featureReviewTargets with object-specific "
             "identity-defining semantic systems before strict validation"
@@ -1102,6 +1900,7 @@ def validate_feature_reviews(
         visible = review.get("visible")
         if visible is not None and not isinstance(visible, bool):
             errors.append(f"{item_label}.visible must be boolean")
+        validate_string_array(review.get("viewIds"), f"{item_label}.viewIds", errors)
 
 
 def validate_review_history(spec: dict[str, Any], errors: list[str], warnings: list[str]) -> None:
@@ -1112,71 +1911,154 @@ def validate_review_history(spec: dict[str, Any], errors: list[str], warnings: l
         errors.append("reviewHistory must be an array")
         return
     for index, entry in enumerate(history):
+        label = f"reviewHistory[{index}]"
         if not isinstance(entry, dict):
-            errors.append(f"reviewHistory[{index}] must be an object")
+            errors.append(f"{label} must be an object")
             continue
+        pass_id = entry.get("passId")
+        if not isinstance(pass_id, str) or not pass_id.strip():
+            errors.append(f"{label}.passId is required")
         action = entry.get("action")
-        if action is not None and action not in VALID_REVIEW_ACTIONS:
-            errors.append(f"reviewHistory[{index}].action is invalid")
+        if action not in VALID_REVIEW_ACTIONS:
+            errors.append(f"{label}.action is invalid")
+        if schema_at_least(spec, "3.0"):
+            review_hash = entry.get("specHash")
+            if not isinstance(review_hash, str) or not review_hash:
+                errors.append(f"{label}.specHash is required for schema 3")
+            if not isinstance(entry.get("summary"), str) or not entry["summary"].strip():
+                errors.append(f"{label}.summary is required for schema 3")
         fidelity = entry.get("estimatedFidelity")
         if fidelity is not None:
-            validate_unit_interval(fidelity, f"reviewHistory[{index}].estimatedFidelity", errors)
-        for field in ("matched", "mismatches", "specFixes", "codeFixes", "evidence"):
-            validate_string_array(entry.get(field), f"reviewHistory[{index}].{field}", errors)
-        visual = entry.get("visualEvidence")
-        if visual is not None:
-            validate_visual_evidence_item(visual, f"reviewHistory[{index}].visualEvidence", errors)
-        validate_feature_reviews(entry, f"reviewHistory[{index}]", errors)
-        pass_id = entry.get("passId")
+            validate_unit_interval(fidelity, f"{label}.estimatedFidelity", errors)
+        for field in ("matched", "mismatches", "specFixes", "codeFixes", "extraEvidence"):
+            validate_string_array(entry.get(field), f"{label}.{field}", errors)
+        root_cause = entry.get("rootCause")
+        if root_cause is not None and root_cause not in VALID_REVIEW_ROOT_CAUSES:
+            errors.append(f"{label}.rootCause is invalid")
+        correction_plan = entry.get("correctionPlan")
+        if correction_plan is not None:
+            if not isinstance(correction_plan, list):
+                errors.append(f"{label}.correctionPlan must be an array")
+            else:
+                for correction_index, correction in enumerate(correction_plan):
+                    correction_label = f"{label}.correctionPlan[{correction_index}]"
+                    if not isinstance(correction, dict):
+                        errors.append(f"{correction_label} must be an object")
+                        continue
+                    for field in ("target", "parameterPath", "action", "reason"):
+                        if not isinstance(correction.get(field), str) or not correction[field].strip():
+                            errors.append(f"{correction_label}.{field} is required")
+                    if correction.get("action") not in VALID_CORRECTION_ACTIONS:
+                        errors.append(
+                            f"{correction_label}.action must be one of: "
+                            + ", ".join(sorted(VALID_CORRECTION_ACTIONS))
+                        )
+        correction_batch = entry.get("correctionBatch")
+        if correction_batch is not None:
+            if not isinstance(correction_batch, dict):
+                errors.append(f"{label}.correctionBatch must be an object")
+            else:
+                if correction_batch.get("artifactType") != "threejs-sculpt-correction-batch":
+                    errors.append(f"{label}.correctionBatch artifactType is invalid")
+                if correction_batch.get("version") != 1:
+                    errors.append(f"{label}.correctionBatch version must be 1")
+                if correction_batch.get("atomic") is not True:
+                    errors.append(f"{label}.correctionBatch.atomic must be true")
+                batch_corrections = correction_batch.get("corrections")
+                if not isinstance(batch_corrections, list) or not batch_corrections:
+                    errors.append(f"{label}.correctionBatch.corrections must be non-empty")
+                scopes = correction_batch.get("scopes")
+                if (
+                    not isinstance(scopes, list)
+                    or not scopes
+                    or any(scope not in {"spec", "code"} for scope in scopes)
+                ):
+                    errors.append(f"{label}.correctionBatch.scopes must contain spec and/or code")
         if (
-            pass_id in VISUAL_PASS_IDS
-            and action == "continue"
-            and not (isinstance(visual, dict) and visual.get("renderScreenshot"))
+            spec.get("qualityProfile") == "reference-fidelity"
+            and action in {"refine-spec", "refine-code", "refine-batch"}
         ):
-            warnings.append(
-                f"reviewHistory[{index}] continues visual pass {pass_id!r} without a render screenshot"
-            )
-        if pass_id in VISUAL_PASS_IDS and action == "continue":
-            if not isinstance(visual, dict) or not visual.get("comparisonImage"):
-                warnings.append(
-                    f"quality: reviewHistory[{index}] continues visual pass {pass_id!r} without an AI vision comparison image"
-                )
-            score = entry.get("aiVisionScore")
-            threshold = entry.get("visualAcceptanceThreshold", 0.7)
-            if not is_number(score):
-                warnings.append(
-                    f"quality: reviewHistory[{index}] continues visual pass {pass_id!r} without aiVisionScore"
-                )
-            elif is_number(threshold) and float(score) < float(threshold):
-                warnings.append(
-                    f"quality: reviewHistory[{index}] aiVisionScore {score} is below threshold {threshold}"
-                )
-            loop = spec.get("selfCorrectLoop")
-            acceptance = loop.get("visualAcceptance", {}) if isinstance(loop, dict) else {}
-            if isinstance(acceptance, dict) and acceptance.get("layerScoresRequired") is True:
-                layer_scores = entry.get("layerScores")
-                if not isinstance(layer_scores, dict) or not layer_scores:
-                    warnings.append(
-                        f"quality: reviewHistory[{index}] continues visual pass {pass_id!r} without layerScores"
-                    )
+            if root_cause in {None, ""}:
+                warnings.append(f"quality: {label} refinement needs a classified rootCause")
+            if not correction_plan and not isinstance(correction_batch, dict):
+                warnings.append(f"quality: {label} refinement needs a structured correctionPlan")
+        legacy_visual = entry.get("visualEvidence")
+        if legacy_visual is not None:
+            validate_visual_evidence_item(legacy_visual, f"{label}.visualEvidence", errors)
+        evidence = entry.get("evidence")
+        if evidence is not None:
+            if isinstance(evidence, list) and not schema_at_least(spec, "3.0"):
+                validate_string_array(evidence, f"{label}.evidence", errors)
+            elif not isinstance(evidence, dict):
+                errors.append(f"{label}.evidence must be an object")
+            elif evidence.get("type") == "visual":
+                views = evidence.get("views")
+                if not isinstance(views, list) or not views:
+                    errors.append(f"{label}.evidence.views must be a non-empty array")
                 else:
-                    required_layers = acceptance.get("requiredLayerScores", [])
-                    if isinstance(required_layers, list):
-                        missing_layers = [
-                            layer
-                            for layer in required_layers
-                            if isinstance(layer, str) and layer not in layer_scores
-                        ]
-                        if missing_layers:
-                            warnings.append(
-                                f"quality: reviewHistory[{index}] layerScores missing: "
-                                + ", ".join(missing_layers)
-                            )
-            failures = feature_gate_failures(spec, entry, str(pass_id))
-            for failure in failures:
-                warnings.append(
-                    f"quality: reviewHistory[{index}] feature gate failed: {failure}"
-                )
+                    for view_index, view in enumerate(views):
+                        view_label = f"{label}.evidence.views[{view_index}]"
+                        if not isinstance(view, dict):
+                            errors.append(f"{view_label} must be an object")
+                            continue
+                        for field in ("viewId", "referenceImage", "renderScreenshot", "comparisonImage"):
+                            if not isinstance(view.get(field), str) or not view[field].strip():
+                                errors.append(f"{view_label}.{field} is required")
+                        validate_fit_diagnostics(
+                            view.get("fitDiagnostics"),
+                            f"{view_label}.fitDiagnostics",
+                            errors,
+                        )
+                        overlay = view.get("diagnosticOverlay")
+                        if overlay is not None and (
+                            not isinstance(overlay, str) or not overlay.strip()
+                        ):
+                            errors.append(f"{view_label}.diagnosticOverlay must be a string")
+                for field in (
+                    "artifactType",
+                    "generator",
+                    "manifestSha256",
+                    "comparisonImage",
+                    "comparisonSha256",
+                ):
+                    value = evidence.get(field)
+                    if value is not None and (not isinstance(value, str) or not value.strip()):
+                        errors.append(f"{label}.evidence.{field} must be a non-empty string")
+                manifest_version = evidence.get("manifestVersion")
+                if manifest_version is not None and (
+                    not isinstance(manifest_version, int) or isinstance(manifest_version, bool)
+                ):
+                    errors.append(f"{label}.evidence.manifestVersion must be an integer")
+        reviewer = entry.get("reviewerEvidence")
+        if reviewer is not None:
+            if not isinstance(reviewer, dict):
+                errors.append(f"{label}.reviewerEvidence must be an object")
+            else:
+                for field in ("type", "model", "reviewedArtifactSha256", "reviewedAt"):
+                    if not isinstance(reviewer.get(field), str) or not reviewer[field].strip():
+                        errors.append(f"{label}.reviewerEvidence.{field} is required")
+        validate_feature_reviews(entry, label, errors)
+        runtime_checks = entry.get("runtimeChecks")
+        if runtime_checks is not None and (
+            not isinstance(runtime_checks, dict)
+            or not all(isinstance(value, bool) for value in runtime_checks.values())
+        ):
+            errors.append(f"{label}.runtimeChecks must contain boolean values")
+        metrics = entry.get("metrics")
+        if metrics is not None and (
+            not isinstance(metrics, dict)
+            or not all(is_number(value) for value in metrics.values())
+        ):
+            errors.append(f"{label}.metrics must contain finite numeric values")
+        artifacts = entry.get("artifacts")
+        if artifacts is not None and (
+            not isinstance(artifacts, dict)
+            or not all(isinstance(value, str) and value.strip() for value in artifacts.values())
+        ):
+            errors.append(f"{label}.artifacts must contain non-empty path or URL strings")
+        if action == "continue" and isinstance(pass_id, str):
+            for failure in review_failures(spec, entry, pass_id):
+                warnings.append(f"quality: {label} gate failed: {failure}")
 
 
 def validate_visual_evidence_history(spec: dict[str, Any], errors: list[str]) -> None:
@@ -1199,6 +2081,11 @@ def validate_build_passes(spec: dict[str, Any], errors: list[str], warnings: lis
         errors.append("buildPasses must be an array")
         return []
     ids: list[str] = []
+    known_components = {
+        item.get("id")
+        for item in spec.get("componentTree", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
     for index, item in enumerate(build_passes):
         if not isinstance(item, dict):
             errors.append(f"buildPasses[{index}] must be an object")
@@ -1210,60 +2097,112 @@ def validate_build_passes(spec: dict[str, Any], errors: list[str], warnings: lis
         if pass_id in ids:
             errors.append(f"duplicate buildPasses id {pass_id!r}")
         ids.append(pass_id)
-        for field in ("goal",):
+        for field in ("goal", "label", "objective"):
             value = item.get(field)
             if value is not None and not isinstance(value, str):
                 errors.append(f"buildPasses[{index}].{field} must be a string")
         validate_string_array(item.get("componentRefs"), f"buildPasses[{index}].componentRefs", errors)
         validate_string_array(item.get("acceptance"), f"buildPasses[{index}].acceptance", errors)
+        if isinstance(item.get("componentRefs"), list):
+            for component_id in item["componentRefs"]:
+                if isinstance(component_id, str) and component_id not in known_components:
+                    errors.append(
+                        f"buildPasses[{index}].componentRefs references unknown component {component_id!r}"
+                    )
+        evidence_kind = item.get("evidenceType")
+        if evidence_kind is not None and evidence_kind not in {"visual", "runtime", "metrics"}:
+            errors.append(f"buildPasses[{index}].evidenceType must be visual, runtime, or metrics")
+        if schema_at_least(spec, "3.0") and evidence_kind is None:
+            errors.append(f"buildPasses[{index}].evidenceType is required for schema 3")
+        validate_string_array(item.get("requiredViews"), f"buildPasses[{index}].requiredViews", errors)
+        validate_string_array(
+            item.get("diagnosticViews"),
+            f"buildPasses[{index}].diagnosticViews",
+            errors,
+        )
+        validate_string_array(
+            item.get("requiredRuntimeChecks"),
+            f"buildPasses[{index}].requiredRuntimeChecks",
+            errors,
+        )
+        validate_string_array(
+            item.get("requiredMetrics"),
+            f"buildPasses[{index}].requiredMetrics",
+            errors,
+        )
+        validate_string_array(
+            item.get("requiredArtifacts"),
+            f"buildPasses[{index}].requiredArtifacts",
+            errors,
+        )
+        layer_targets = item.get("requiredLayerScores")
+        if layer_targets is not None and (
+            not isinstance(layer_targets, dict)
+            or not all(is_number(value) and 0 <= float(value) <= 1 for value in layer_targets.values())
+        ):
+            errors.append(f"buildPasses[{index}].requiredLayerScores must contain scores from 0 to 1")
+        metric_targets = item.get("metricTargets")
+        if metric_targets is not None:
+            if not isinstance(metric_targets, dict):
+                errors.append(f"buildPasses[{index}].metricTargets must be an object")
+            else:
+                for metric, target in metric_targets.items():
+                    if not isinstance(target, dict) or not any(is_number(target.get(bound)) for bound in ("min", "max")):
+                        errors.append(
+                            f"buildPasses[{index}].metricTargets.{metric} needs a finite min or max"
+                        )
+        if schema_at_least(spec, "3.0"):
+            if evidence_kind == "visual" and (
+                not item.get("requiredViews") or not item.get("requiredLayerScores")
+            ):
+                errors.append(
+                    f"buildPasses[{index}] visual evidence needs requiredViews and requiredLayerScores"
+                )
+            if evidence_kind == "runtime" and not item.get("requiredRuntimeChecks"):
+                errors.append(
+                    f"buildPasses[{index}] runtime evidence needs requiredRuntimeChecks"
+                )
+            if evidence_kind == "metrics" and (
+                not item.get("requiredMetrics") or not item.get("requiredArtifacts")
+            ):
+                errors.append(
+                    f"buildPasses[{index}] metrics evidence needs requiredMetrics and requiredArtifacts"
+                )
+            if item.get("requiredPostOptimizationVisualReview") is not None and not isinstance(
+                item.get("requiredPostOptimizationVisualReview"), bool
+            ):
+                errors.append(
+                    f"buildPasses[{index}].requiredPostOptimizationVisualReview must be boolean"
+                )
+            if item.get("maximumVisualRegression") is not None:
+                validate_unit_interval(
+                    item["maximumVisualRegression"],
+                    f"buildPasses[{index}].maximumVisualRegression",
+                    errors,
+                )
     if ids:
         if ids[0] != "blockout":
             warnings.append("quality: first build pass should be blockout")
-        if "structural-pass" not in ids:
-            warnings.append("quality: missing structural-pass; component hierarchy may be skipped")
-        if not ({"material-pass", "surface-pass"} & set(ids)):
-            warnings.append("quality: missing material/surface pass; model may stay as flat geometry")
+        if not ({"form", "form-refinement"} & set(ids)):
+            warnings.append("quality: missing form pass; shape refinement may be skipped")
+        if not ({"lookdev", "material-pass"} & set(ids)):
+            warnings.append("quality: missing lookdev/material pass; model may stay as flat geometry")
+        if spec.get("intendedUse") in {"browser-prop", "game-prop", "playable", "destructible"}:
+            optimization = next(
+                (
+                    item
+                    for item in build_passes
+                    if isinstance(item, dict) and item.get("id") in {"optimization", "optimization-pass"}
+                ),
+                None,
+            )
+            if not isinstance(optimization, dict) or optimization.get(
+                "requiredPostOptimizationVisualReview"
+            ) is not True:
+                warnings.append(
+                    "quality: real-time optimization needs a fresh visual review and no-regression gate"
+                )
     return ids
-
-
-def review_completes_pass(
-    spec: dict[str, Any],
-    entry: dict[str, Any],
-    pass_id: str,
-) -> bool:
-    if entry.get("passId") != pass_id or entry.get("action") != "continue":
-        return False
-    visual = entry.get("visualEvidence")
-    if pass_id in VISUAL_PASS_IDS:
-        if not (
-            isinstance(visual, dict)
-            and visual.get("renderScreenshot")
-            and visual.get("comparisonImage")
-        ):
-            return False
-        score = entry.get("aiVisionScore")
-        threshold = entry.get("visualAcceptanceThreshold", 0.7)
-        if not is_number(score) or not is_number(threshold) or float(score) < float(threshold):
-            return False
-        if feature_gate_failures(spec, entry, pass_id):
-            return False
-    return True
-
-
-def completed_passes_from_history(spec: dict[str, Any], pass_ids: list[str]) -> list[str]:
-    history = spec.get("reviewHistory", [])
-    if not isinstance(history, list):
-        return []
-    completed: list[str] = []
-    for pass_id in pass_ids:
-        if any(
-            isinstance(entry, dict) and review_completes_pass(spec, entry, pass_id)
-            for entry in history
-        ):
-            completed.append(pass_id)
-        else:
-            break
-    return completed
 
 
 def validate_sculpt_pipeline(
@@ -1274,7 +2213,7 @@ def validate_sculpt_pipeline(
 ) -> None:
     pipeline = spec.get("sculptPipeline")
     if pipeline is None:
-        warnings.append("quality: missing sculptPipeline; pass order is not locked and generation can skip build passes")
+        warnings.append("quality: missing sculptPipeline; run the status/sync command")
         return
     if not isinstance(pipeline, dict):
         errors.append("sculptPipeline must be an object")
@@ -1294,15 +2233,16 @@ def validate_sculpt_pipeline(
     completed = pipeline.get("completedPasses", [])
     validate_string_array(completed, "sculptPipeline.completedPasses", errors)
     if isinstance(completed, list):
-        expected = completed_passes_from_history(spec, pass_order_ids or build_pass_ids)
+        expected_status = pipeline_status(spec)
+        expected = expected_status["completedPasses"]
         if list(completed) != expected:
-            warnings.append("sculptPipeline.completedPasses is out of sync with reviewHistory; run sculpt_pass_orchestrator.py sync")
+            warnings.append("sculptPipeline.completedPasses is out of sync; run `sculpt status --sync`")
         for pass_id in completed:
             if pass_id not in (pass_order_ids or build_pass_ids):
                 errors.append(f"sculptPipeline.completedPasses contains unknown pass {pass_id!r}")
     gate_mode = pipeline.get("passGateMode")
-    if gate_mode != "locked-sequential":
-        warnings.append("quality: sculptPipeline.passGateMode should be locked-sequential")
+    if gate_mode not in {"adaptive-sequential", "locked-sequential"}:
+        warnings.append("quality: sculptPipeline.passGateMode should be adaptive-sequential")
     validate_string_array(pipeline.get("nextRequiredEvidence"), "sculptPipeline.nextRequiredEvidence", errors)
 
 
@@ -1336,7 +2276,12 @@ def reference_pbr_usable(material: dict[str, Any], threshold: float) -> tuple[bo
         return False, f"material {material_id!r} needs usable referencePbr extracted from source pixels"
     if reference.get("usable") is not True:
         return False, f"material {material_id!r} referencePbr.usable must be true"
-    confidence = reference.get("confidence", reference.get("estimatedFidelity"))
+    if reference.get("materialCropConfirmed") is not True:
+        return False, f"material {material_id!r} referencePbr must come from a confirmed material crop"
+    confidence = reference.get(
+        "extractionSuitability",
+        reference.get("confidence", reference.get("estimatedFidelity")),
+    )
     if not is_number(confidence) or float(confidence) < threshold:
         return False, f"material {material_id!r} referencePbr confidence must be >= {threshold}"
     maps = reference.get("maps")
@@ -1344,8 +2289,8 @@ def reference_pbr_usable(material: dict[str, Any], threshold: float) -> tuple[bo
         return False, f"material {material_id!r} referencePbr needs maps"
     for channel in ("albedo", "roughness", "height", "normal", "ao"):
         entry = maps.get(channel)
-        if not isinstance(entry, dict) or not has_non_empty_detail(entry.get("url") or entry.get("path")):
-            return False, f"material {material_id!r} referencePbr missing {channel} map path/url"
+        if not isinstance(entry, dict) or not has_non_empty_detail(entry.get("url")):
+            return False, f"material {material_id!r} referencePbr missing browser URL for {channel}"
     return True, ""
 
 
@@ -1357,6 +2302,8 @@ def validate_look_dev_targets(spec: dict[str, Any], errors: list[str], warnings:
         errors.append("lookDevTargets must be an object")
     materials = [item for item in spec.get("materials", []) if isinstance(item, dict)]
     if materials:
+        warnings.extend(f"quality: {gap}" for gap in material_gaps(spec))
+        warnings.extend(f"quality: {gap}" for gap in surface_gaps(spec))
         has_palette = any(
             has_non_empty_detail(item.get("colorVariation"))
             or has_non_empty_detail(item.get("albedo", {}).get("secondary") if isinstance(item.get("albedo"), dict) else None)
@@ -1370,13 +2317,22 @@ def validate_look_dev_targets(spec: dict[str, Any], errors: list[str], warnings:
             for item in materials
         )
         has_locality = any(
-            has_non_empty_detail(item.get("localOverrides"))
+            any(
+                isinstance(override, dict)
+                and override.get("type") in EXECUTABLE_LOCAL_MATERIAL_TYPES
+                and (_layer_value(override.get("amount")) or 0) > 0
+                and isinstance(override.get("mask"), dict)
+                for override in (
+                    item.get("localOverrides")
+                    if isinstance(item.get("localOverrides"), list)
+                    else []
+                )
+            )
+            or has_non_empty_detail(item.get("ambientOcclusion"))
             or (
                 isinstance(item.get("wear"), dict)
                 and (
                     layer_number(item["wear"].get("edgeWear"), ("base", "amount")) > 0
-                    or has_non_empty_detail(item["wear"].get("scratches"))
-                    or has_non_empty_detail(item["wear"].get("chips"))
                 )
             )
             or (
@@ -1386,20 +2342,14 @@ def validate_look_dev_targets(spec: dict[str, Any], errors: list[str], warnings:
                     or layer_number(item["dirt"].get("cavityBias"), ("base", "amount")) > 0
                 )
             )
-            or has_non_empty_detail(item.get("moss"))
-            or has_non_empty_detail(item.get("stains"))
-            or has_non_empty_detail(item.get("scratches"))
-            or has_non_empty_detail(item.get("chips"))
-            or has_non_empty_detail(item.get("wetness"))
-            or has_non_empty_detail(item.get("patina"))
             for item in materials
         )
         if not has_palette:
-            warnings.append("quality: material-pass needs reference-derived albedo palette or secondary/accent color zones")
+            warnings.append("quality: lookdev needs a reference-derived albedo palette or secondary/accent color zones")
         if not has_response:
-            warnings.append("quality: material-pass needs roughness variation or normal/bump/displacement response")
+            warnings.append("quality: lookdev needs roughness variation or normal/bump/displacement response")
         if not has_locality:
-            warnings.append("quality: material-pass needs local overrides, AO, dirt, wear, stains, moss, chips, scratches, or equivalent masks")
+            warnings.append("quality: lookdev needs local overrides, AO, dirt, wear, stains, moss, chips, scratches, or equivalent masks")
         quality_first = isinstance(targets, dict) and targets.get("qualityPriority") == "reference-fidelity"
         if quality_first:
             material_targets = targets.get("materialPass", {})
@@ -1475,17 +2425,57 @@ def validate_look_dev_targets(spec: dict[str, Any], errors: list[str], warnings:
     else:
         meaningful = [item for item in lighting if has_non_empty_detail(item)]
         if len(meaningful) < 3:
-            warnings.append("quality: lighting-pass needs concrete key/fill/rim or environment light entries")
+            warnings.append("quality: lookdev needs concrete key/fill/rim or environment light entries")
         lighting_text = " ".join(str(item).lower() for item in meaningful)
         if meaningful and not any(term in lighting_text for term in ("exposure", "tone", "aces", "filmic")):
-            warnings.append("quality: lighting-pass needs exposure and tone mapping intent")
+            warnings.append("quality: lookdev needs exposure and tone mapping intent")
         if meaningful and not any(term in lighting_text for term in ("contact shadow", "ground shadow", "ambient occlusion", "ao")):
-            warnings.append("quality: lighting-pass needs contact shadow or ground shadow behavior")
+            warnings.append("quality: lookdev needs contact shadow or ground shadow behavior")
 
 
-def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
+def validate_spec(
+    spec: dict[str, Any],
+    for_pass: str | None = None,
+) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
+    schema_version = spec.get("schemaVersion")
+    try:
+        parsed_schema_version = parse_schema_version(schema_version)
+    except ValueError as exc:
+        parsed_schema_version = None
+        errors.append(str(exc))
+    if parsed_schema_version not in SUPPORTED_SCHEMA_VERSIONS:
+        errors.append("schemaVersion must be '2.0', '3.0', or '3.1'")
+    if parsed_schema_version is not None and parsed_schema_version >= (3, 0, 0):
+        required_v3 = {
+            "specRevision": int,
+            "intendedUse": str,
+            "qualityProfile": str,
+            "preSpecAssessment": dict,
+            "qualityContract": dict,
+            "qualityTargets": dict,
+            "selfCorrectLoop": dict,
+            "actionReadiness": dict,
+            "viewEvidence": list,
+            "buildPasses": list,
+            "reviewHistory": list,
+        }
+        for key, expected_type in required_v3.items():
+            if key not in spec:
+                errors.append(f"missing schema 3 field {key!r}")
+            elif not isinstance(spec[key], expected_type) or (
+                expected_type is int and isinstance(spec[key], bool)
+            ):
+                errors.append(f"schema 3 field {key!r} must be {expected_type.__name__}")
+        if spec.get("intendedUse") not in {
+            "static-render", "browser-prop", "game-prop", "animated", "playable", "destructible"
+        }:
+            errors.append("intendedUse is invalid")
+        if spec.get("qualityProfile") not in {"balanced", "reference-fidelity"}:
+            errors.append("qualityProfile must be balanced or reference-fidelity")
+        if isinstance(spec.get("specRevision"), int) and not isinstance(spec.get("specRevision"), bool) and spec["specRevision"] < 1:
+            errors.append("specRevision must be a positive integer")
     for key, expected_type in REQUIRED_TOP_LEVEL.items():
         if key not in spec:
             errors.append(f"missing top-level field {key!r}")
@@ -1500,8 +2490,10 @@ def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
     validate_quality_targets(spec, errors, warnings)
     validate_quality_contract(spec, errors, warnings)
     validate_action_readiness(spec, errors, warnings)
+    validate_view_hypothesis_policy(spec, errors, warnings)
     validate_self_correct_loop(spec, errors, warnings)
     validate_feature_review_targets(spec, errors, warnings)
+    validate_specialized_regions(spec, errors, warnings)
     validate_review_history(spec, errors, warnings)
     validate_visual_evidence_history(spec, errors)
     build_pass_ids = validate_build_passes(spec, errors, warnings)
@@ -1509,22 +2501,59 @@ def validate_spec(spec: dict[str, Any]) -> tuple[list[str], list[str]]:
     validate_look_dev_targets(spec, errors, warnings)
     evidence_ids = validate_evidence(spec, errors, warnings)
     material_ids = validate_materials(spec, errors, warnings)
+    errors.extend(validate_repetition_systems(spec.get("repetitionSystems", [])))
     validate_components(spec, material_ids, evidence_ids, errors, warnings)
+    topology_errors, topology_warnings = validate_surface_topology_plan(
+        spec.get("surfaceTopologyPlan"),
+        spec.get("componentTree", []),
+        spec.get("materials", []),
+    )
+    errors.extend(topology_errors)
+    warnings.extend(topology_warnings)
+    validate_special_material_compatibility(spec, warnings)
     lod_plan = spec.get("lodPlan")
     if lod_plan is not None and not isinstance(lod_plan, list):
         errors.append("lodPlan must be an array")
     performance = spec.get("performanceBudget")
+    has_metrics_pass = any(
+        isinstance(item, dict) and item.get("evidenceType") == "metrics"
+        for item in spec.get("buildPasses", [])
+    )
+    if schema_at_least(spec, "3.0") and has_metrics_pass and performance is None:
+        errors.append("performanceBudget is required when a metrics pass is active")
     if performance is not None and not isinstance(performance, dict):
         errors.append("performanceBudget must be an object")
+    elif isinstance(performance, dict):
+        for field in ("targetTriangles", "maxDrawCalls", "textureSize", "fpsTarget"):
+            if has_metrics_pass and field in {"targetTriangles", "maxDrawCalls", "fpsTarget"} and field not in performance:
+                errors.append(f"performanceBudget.{field} is required by the metrics pass")
+                continue
+            if field in performance and (
+                not is_number(performance[field]) or float(performance[field]) <= 0
+            ):
+                errors.append(f"performanceBudget.{field} must be a positive finite number")
     validate_quality_depth(spec, errors, warnings)
+    if for_pass is not None:
+        ids = canonical_pass_order(spec)
+        if for_pass not in ids:
+            errors.append(f"unknown --for-pass {for_pass!r}; expected one of: {', '.join(ids)}")
+        else:
+            errors.extend(
+                f"pass {for_pass!r} readiness: {gap}"
+                for gap in pass_specific_gaps(spec, for_pass)
+            )
     if suitability == "pass" and spec.get("risks"):
         warnings.append("suitability is pass but risks are present; confirm they are acceptable")
-    return errors, warnings
+    return list(dict.fromkeys(errors)), list(dict.fromkeys(warnings))
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("spec", type=Path)
+    parser.add_argument(
+        "--for-pass",
+        help="Validate core schema plus readiness rules relevant to one build pass.",
+    )
     parser.add_argument("--json", action="store_true", help="Print machine-readable result")
     parser.add_argument(
         "--strict-quality",
@@ -1533,11 +2562,30 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
 
+    manifest_gate_errors: list[str] = []
     try:
+        from sculpt_modules import is_module_manifest, module_status, read_raw_spec
+
+        raw_spec = read_raw_spec(args.spec)
+        if is_module_manifest(raw_spec):
+            modular_status = module_status(args.spec, raw_spec)
+            manifest_gate_errors.extend(modular_status["errors"])
+            if not modular_status["assemblyReady"]:
+                current = modular_status.get("currentModule") or "none"
+                manifest_gate_errors.append(
+                    "modular assembly is not ready: every required module must have a current "
+                    f"hash-bound acceptance; current module is {current!r}"
+                )
         spec = load_spec(args.spec)
-        errors, warnings = validate_spec(spec)
+        errors, warnings = validate_spec(spec, args.for_pass)
     except ValueError as exc:
         errors, warnings = [str(exc)], []
+
+    errors.extend(manifest_gate_errors)
+
+    warnings = [
+        warning for warning in warnings if warning_applies_to_pass(warning, args.for_pass)
+    ]
 
     if args.strict_quality:
         errors.extend(

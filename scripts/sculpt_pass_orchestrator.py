@@ -1,137 +1,42 @@
 #!/usr/bin/env python3
-"""Gate procedural sculpt generation through ordered build passes."""
+"""Inspect and gate the current adaptive sculpt pass."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from visual_feature_gate import feature_gate_failures
+from sculpt_contract import (
+    check_pass as contract_check_pass,
+    component_type,
+    load_spec_file,
+    pass_order,  # compatibility re-export for existing script consumers
+    pipeline_status,
+    sync_pipeline,
+    write_spec_atomic,
+)
+from sculpt_geometry import (
+    VALID_PRIMITIVES,
+    validate_geometry_component,
+    validate_repetition_systems,
+)
 
 
-DEFAULT_PASS_ORDER = [
-    "blockout",
-    "structural-pass",
-    "form-refinement",
-    "material-pass",
-    "surface-pass",
-    "lighting-pass",
-    "interaction-pass",
-    "optimization-pass",
-]
-VISUAL_PASS_IDS = set(DEFAULT_PASS_ORDER) - {"optimization-pass"}
 ATTACHMENT_ROLES = {
-    "appendage",
-    "branch",
-    "limb",
-    "arm",
-    "leg",
-    "handle",
-    "connector",
-    "tube",
-    "cable",
-    "horn",
-    "wing",
-    "tail",
-    "root",
-    "fork",
-    "rib",
-    "support",
-    "hinge",
-    "socket",
-    "pipe",
+    "appendage", "branch", "limb", "arm", "leg", "handle", "connector",
+    "tube", "cable", "horn", "wing", "tail", "root", "fork", "rib",
+    "support", "hinge", "socket", "pipe",
 }
 ATTACHMENT_PRIMITIVES = {"cylinder", "cone", "capsule", "tube", "curve-sweep"}
-
-
-def load_spec(path: Path) -> dict[str, Any]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise ValueError("spec must be a JSON object")
-    return payload
-
-
-def write_spec(path: Path, spec: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def pass_order(spec: dict[str, Any]) -> list[str]:
-    ids: list[str] = []
-    for item in spec.get("buildPasses", []):
-        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"].strip():
-            ids.append(item["id"])
-    return ids or DEFAULT_PASS_ORDER.copy()
-
-
-def pass_acceptance(spec: dict[str, Any], pass_id: str) -> list[str]:
-    for item in spec.get("buildPasses", []):
-        if isinstance(item, dict) and item.get("id") == pass_id:
-            acceptance = item.get("acceptance", [])
-            if isinstance(acceptance, list):
-                return [str(value) for value in acceptance if str(value).strip()]
-    return []
-
-
-def visual_evidence(entry: dict[str, Any]) -> dict[str, Any]:
-    visual = entry.get("visualEvidence")
-    return visual if isinstance(visual, dict) else {}
-
-
-def review_completes_pass(spec: dict[str, Any], entry: dict[str, Any], pass_id: str) -> bool:
-    if entry.get("passId") != pass_id or entry.get("action") != "continue":
-        return False
-    if pass_id in VISUAL_PASS_IDS:
-        visual = visual_evidence(entry)
-        if not visual.get("renderScreenshot") or not visual.get("comparisonImage"):
-            return False
-        score = entry.get("aiVisionScore")
-        threshold = entry.get("visualAcceptanceThreshold", 0.7)
-        if not has_number(score) or not has_number(threshold) or float(score) < float(threshold):
-            return False
-        if feature_gate_failures(spec, entry, pass_id):
-            return False
-    return True
-
-
-def completed_passes(spec: dict[str, Any], ids: list[str]) -> list[str]:
-    history = spec.get("reviewHistory", [])
-    if not isinstance(history, list):
-        return []
-    completed: list[str] = []
-    for pass_id in ids:
-        if any(
-            isinstance(entry, dict) and review_completes_pass(spec, entry, pass_id)
-            for entry in history
-        ):
-            completed.append(pass_id)
-        else:
-            break
-    return completed
-
-
-def current_pass(ids: list[str], completed: list[str]) -> str:
-    if len(completed) >= len(ids):
-        return "complete"
-    return ids[len(completed)]
-
-
-def next_required_evidence(spec: dict[str, Any], pass_id: str) -> list[str]:
-    if pass_id == "complete":
-        return []
-    evidence = pass_acceptance(spec, pass_id)
-    evidence.extend(pass_specific_evidence(pass_id))
-    if pass_id in VISUAL_PASS_IDS:
-        evidence.append("browser render screenshot from the Codex in-app Browser")
-        evidence.append("side-by-side reference/render comparison sheet for AI vision review")
-        evidence.append("AI vision score at or above the visual acceptance threshold")
-        evidence.append("all critical semantic feature scores from the shared image pair at or above their thresholds")
-        evidence.append("self-correction review appended with action=continue before the next pass")
-    return evidence
+SPECIAL_PRIMITIVE_PROFILES = {
+    "fiber-system": "fiber",
+    "volume-field": "volume",
+}
 
 
 def has_non_empty(value: Any) -> bool:
@@ -142,42 +47,45 @@ def has_non_empty(value: Any) -> bool:
     if isinstance(value, dict):
         return any(has_non_empty(item) for item in value.values())
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return abs(float(value)) > 0
+        return math.isfinite(float(value)) and abs(float(value)) > 0
     return False
 
 
-def number_from_layer(value: Any, keys: tuple[str, ...]) -> float:
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-    if isinstance(value, dict):
-        for key in keys:
-            item = value.get(key)
-            if isinstance(item, (int, float)) and not isinstance(item, bool):
-                return float(item)
-    return 0.0
-
-
-def is_vector3(value: Any) -> bool:
+def has_number(value: Any) -> bool:
     return (
-        isinstance(value, list)
-        and len(value) == 3
-        and all(isinstance(item, (int, float)) and not isinstance(item, bool) for item in value)
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
     )
 
 
-def has_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+def is_vector3(value: Any) -> bool:
+    return isinstance(value, list) and len(value) == 3 and all(has_number(item) for item in value)
+
+
+def layer_number(value: Any, keys: tuple[str, ...]) -> float:
+    if has_number(value):
+        return float(value)
+    if isinstance(value, dict):
+        for key in keys:
+            if has_number(value.get(key)):
+                return float(value[key])
+    return 0.0
 
 
 def component_requires_attachment(component: dict[str, Any]) -> bool:
-    if not component.get("parent"):
+    if component_type(component) == "assembly" or not component.get("parent"):
         return False
-    role = str(component.get("role") or "").lower()
-    name = str(component.get("name") or component.get("id") or "").lower()
+    tokens = set(
+        re.findall(
+            r"[a-z0-9]+",
+            " ".join(
+                str(component.get(field) or "").lower()
+                for field in ("name", "id", "role")
+            ),
+        )
+    )
     primitive = str(component.get("primitive") or "").lower()
-    action = component.get("actionProfile") if isinstance(component.get("actionProfile"), dict) else {}
-    animation_role = str(action.get("animationRole") or "").lower()
-    tokens = {role, animation_role} | set(re.findall(r"[a-z0-9]+", name))
     return bool(tokens & ATTACHMENT_ROLES) or primitive in ATTACHMENT_PRIMITIVES
 
 
@@ -185,15 +93,17 @@ def attachment_complete(component: dict[str, Any]) -> bool:
     attachment = component.get("attachment")
     if not isinstance(attachment, dict):
         return False
-    has_endpoint = is_vector3(attachment.get("localStart")) and is_vector3(attachment.get("localEnd"))
-    has_socket = has_non_empty(attachment.get("parentSocket")) or has_non_empty(attachment.get("parentId"))
-    has_contact = has_non_empty(attachment.get("contactType"))
-    has_overlap = (
-        number_from_layer(attachment.get("embedDepth"), ("base", "amount", "value")) > 0
-        or number_from_layer(attachment.get("overlap"), ("base", "amount", "value")) > 0
+    return all(
+        (
+            is_vector3(attachment.get("localStart")),
+            is_vector3(attachment.get("localEnd")),
+            has_non_empty(attachment.get("parentSocket") or attachment.get("parentId")),
+            has_non_empty(attachment.get("contactType")),
+            layer_number(attachment.get("embedDepth"), ("base", "amount", "value")) > 0
+            or layer_number(attachment.get("overlap"), ("base", "amount", "value")) > 0,
+            has_number(attachment.get("gapTolerance")),
+        )
     )
-    has_tolerance = has_number(attachment.get("gapTolerance"))
-    return has_endpoint and has_socket and has_contact and has_overlap and has_tolerance
 
 
 def attachment_gaps(spec: dict[str, Any]) -> list[str]:
@@ -201,341 +111,433 @@ def attachment_gaps(spec: dict[str, Any]) -> list[str]:
     for component in spec.get("componentTree", []):
         if not isinstance(component, dict) or not component_requires_attachment(component):
             continue
-        if attachment_complete(component):
-            continue
-        component_id = str(component.get("id") or component.get("name") or "(unnamed)")
-        gaps.append(
-            f"component {component_id!r} requires attachment.parentSocket/localStart/localEnd/"
-            "contactType/embedDepth(or overlap)/gapTolerance"
-        )
+        if not attachment_complete(component):
+            component_id = str(component.get("id") or component.get("name") or "(unnamed)")
+            gaps.append(
+                f"component {component_id!r} needs parent socket, endpoints, contact, overlap, and gap tolerance"
+            )
     return gaps
 
 
-def material_has_palette(material: dict[str, Any]) -> bool:
-    color_variation = material.get("colorVariation")
-    if isinstance(color_variation, dict) and len(color_variation.get("palette", [])) >= 2:
-        return True
-    albedo = material.get("albedo")
-    if isinstance(albedo, dict) and has_non_empty(albedo.get("secondary")):
-        return True
-    return has_non_empty(material.get("baseColor") or material.get("color"))
-
-
-def material_has_response(material: dict[str, Any]) -> bool:
-    if number_from_layer(material.get("roughness"), ("variation", "base")) > 0:
-        return True
-    if number_from_layer(material.get("normal"), ("strength", "amplitude")) > 0:
-        return True
-    if number_from_layer(material.get("bump"), ("amplitude", "strength")) > 0:
-        return True
-    if number_from_layer(material.get("displacement"), ("amplitude", "strength")) > 0:
-        return True
-    return False
-
-
-def material_has_locality(material: dict[str, Any]) -> bool:
-    if has_non_empty(material.get("localOverrides")):
-        return True
-    wear = material.get("wear")
-    if isinstance(wear, dict) and (
-        number_from_layer(wear.get("edgeWear"), ("base", "amount")) > 0
-        or has_non_empty(wear.get("scratches"))
-        or has_non_empty(wear.get("chips"))
-    ):
-        return True
-    dirt = material.get("dirt")
-    if isinstance(dirt, dict) and (
-        number_from_layer(dirt.get("amount"), ("base", "amount")) > 0
-        or number_from_layer(dirt.get("cavityBias"), ("base", "amount")) > 0
-    ):
-        return True
-    for field in ("moss", "stains", "scratches", "chips", "wetness", "patina", "soot"):
-        if has_non_empty(material.get(field)):
-            return True
-    return False
-
-
-def quality_first_enabled(spec: dict[str, Any]) -> bool:
-    targets = spec.get("lookDevTargets")
-    return isinstance(targets, dict) and targets.get("qualityPriority") == "reference-fidelity"
-
-
-def reference_pbr_usable(material: dict[str, Any], threshold: float) -> tuple[bool, str]:
-    material_id = str(material.get("id") or "(unnamed)")
-    reference = material.get("referencePbr")
-    if not isinstance(reference, dict):
-        return False, f"material {material_id!r} needs usable referencePbr extracted from source pixels"
-    if reference.get("usable") is not True:
-        return False, f"material {material_id!r} referencePbr.usable must be true"
-    confidence = reference.get("confidence", reference.get("estimatedFidelity"))
-    if not has_number(confidence) or float(confidence) < threshold:
-        return False, f"material {material_id!r} referencePbr confidence must be >= {threshold}"
-    maps = reference.get("maps")
-    if not isinstance(maps, dict):
-        return False, f"material {material_id!r} referencePbr needs maps"
-    for channel in ("albedo", "roughness", "height", "normal", "ao"):
-        entry = maps.get(channel)
-        if not isinstance(entry, dict) or not has_non_empty(entry.get("url") or entry.get("path")):
-            return False, f"material {material_id!r} referencePbr missing {channel} map path/url"
-    return True, ""
-
-
-def quality_first_material_gaps(spec: dict[str, Any], material: dict[str, Any]) -> list[str]:
-    material_id = str(material.get("id") or "(unnamed)")
-    gaps: list[str] = []
-    targets = spec.get("lookDevTargets")
-    material_targets = targets.get("materialPass", {}) if isinstance(targets, dict) else {}
-    minimum_resolution = material_targets.get("minimumTextureResolution", 1024)
-    if not isinstance(minimum_resolution, int) or isinstance(minimum_resolution, bool):
-        minimum_resolution = 1024
-    extraction_targets = material_targets.get("referencePbrExtraction", {})
-    if not isinstance(extraction_targets, dict):
-        extraction_targets = {}
-    pbr_required = (
-        extraction_targets.get("requiredWhenSourceImagePresent") is True
-        and has_non_empty(spec.get("sourceImage"))
+def _intentional_uniform_surface(value: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(value.get(field) or "")
+        for field in ("surfaceIntent", "samplingNotes", "shaderNotes", "notes")
+    ).lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "intentionally smooth",
+            "intentional smooth",
+            "intentionally uniform",
+            "intentional uniform",
+            "flat graphic color",
+        )
     )
-    pbr_threshold = extraction_targets.get("targetThreshold", 0.7)
-    if not has_number(pbr_threshold):
-        pbr_threshold = 0.7
-    resolution = material.get("textureResolution")
-    if not isinstance(resolution, int) or isinstance(resolution, bool) or resolution < minimum_resolution:
-        gaps.append(f"material {material_id!r} textureResolution must be >= {minimum_resolution}")
 
-    projection = material.get("textureProjection")
-    if not isinstance(projection, dict) or not has_non_empty(projection.get("mode")):
-        gaps.append(f"material {material_id!r} needs textureProjection.mode and texel-density intent")
 
-    bands = material.get("surfaceFrequencyBands")
-    band_ids = {
-        str(item.get("id")).lower()
-        for item in bands
-        if isinstance(item, dict) and has_non_empty(item.get("id"))
-    } if isinstance(bands, list) else set()
-    missing_bands = {"macro", "meso", "micro"} - band_ids
-    if missing_bands:
-        gaps.append(
-            f"material {material_id!r} missing surface frequency bands: "
-            + ", ".join(sorted(missing_bands))
+def _hero_material_ids(spec: dict[str, Any], materials: list[dict[str, Any]]) -> set[str]:
+    hero_ids: set[str] = set()
+    for component in spec.get("componentTree", []):
+        if not isinstance(component, dict) or component_type(component) == "assembly":
+            continue
+        importance = component.get("importance", 1.0)
+        if not has_number(importance) or float(importance) < 0.5:
+            continue
+        material_layers = (
+            component.get("materialLayers")
+            if isinstance(component.get("materialLayers"), list)
+            else []
         )
+        for value in [component.get("material"), *material_layers]:
+            if isinstance(value, str) and value.strip():
+                hero_ids.add(value)
+        for feature in component.get("localFeatures", []) if isinstance(component.get("localFeatures"), list) else []:
+            if isinstance(feature, dict) and isinstance(feature.get("material"), str):
+                hero_ids.add(feature["material"])
+    if hero_ids:
+        return hero_ids
+    return {
+        str(item["id"])
+        for item in materials
+        if isinstance(item.get("id"), str) and item.get("qualityTier") != "utility"
+    }
 
-    roughness = material.get("roughness")
-    roughness_map = roughness.get("map") if isinstance(roughness, dict) else None
-    if not has_non_empty(roughness_map) or "albedo" in str(roughness_map).lower():
-        gaps.append(f"material {material_id!r} needs an independent roughness map")
-    if not has_non_empty(material.get("normal")) and not has_non_empty(material.get("bump")):
-        gaps.append(f"material {material_id!r} needs an independent height/normal response")
-    if not has_non_empty(material.get("ambientOcclusion")):
-        gaps.append(f"material {material_id!r} needs an independent ambient-occlusion response")
-    if pbr_required:
-        ok, message = reference_pbr_usable(material, float(pbr_threshold))
-        if not ok:
-            gaps.append(message)
-    return gaps
 
-
-def material_pass_gaps(spec: dict[str, Any]) -> list[str]:
+def material_gaps(spec: dict[str, Any]) -> list[str]:
     materials = [item for item in spec.get("materials", []) if isinstance(item, dict)]
     if not materials:
         return ["materials array is empty"]
-    if not any(material_has_palette(item) for item in materials):
-        return ["no material has a reference-derived albedo palette or secondary color zones"]
+    materials_by_id = {
+        item.get("id"): item
+        for item in materials
+        if isinstance(item.get("id"), str)
+    }
     gaps: list[str] = []
-    if not any(material_has_response(item) for item in materials):
-        gaps.append("no material defines roughness variation or normal/bump/displacement response")
-    if not any(material_has_locality(item) for item in materials):
-        gaps.append("no material defines local overrides, AO, dirt, wear, stains, moss, chips, or scratches")
-    if quality_first_enabled(spec):
+    contract = spec.get("qualityContract")
+    minimums = contract.get("minimumSpecDepth") if isinstance(contract, dict) else {}
+    minimum_materials = minimums.get("materialLayers") if isinstance(minimums, dict) else None
+    if isinstance(minimum_materials, int) and len(materials) < minimum_materials:
+        gaps.append(
+            f"materialLayers is below the selected complexity depth ({len(materials)} < {minimum_materials})"
+        )
+    hero_ids = _hero_material_ids(spec, materials)
+    for material in materials:
+        material_id = str(material.get("id") or "(unnamed)")
+        if material.get("qualityTier") == "utility" or material_id not in hero_ids:
+            continue
+        intentional_uniform = _intentional_uniform_surface(material)
+        variation = material.get("colorVariation")
+        albedo = material.get("albedo")
+        palette_values = (
+            variation.get("palette", []) if isinstance(variation, dict) else []
+        )
+        secondary = albedo.get("secondary", []) if isinstance(albedo, dict) else []
+        palette = len([item for item in [*palette_values, *secondary] if has_non_empty(item)]) >= 2
+        response = (
+            layer_number(material.get("roughness"), ("variation",)) > 0
+            or layer_number(material.get("normal"), ("strength", "amplitude")) > 0
+            or layer_number(material.get("bump"), ("amplitude", "strength")) > 0
+            or layer_number(material.get("displacement"), ("amplitude", "strength")) > 0
+        )
+        locality = (
+            layer_number(material.get("ambientOcclusion"), ("cavityStrength", "strength")) > 0
+            or isinstance(material.get("referencePbr"), dict)
+        )
+        if not palette and not intentional_uniform:
+            gaps.append(
+                f"hero material {material_id!r} needs a multi-color reference palette or an explicit intentional-uniform rule"
+            )
+        if not response and not intentional_uniform:
+            gaps.append(
+                f"hero material {material_id!r} needs executable roughness variation or normal/bump/displacement response"
+            )
+        if not locality and not intentional_uniform:
+            gaps.append(
+                f"hero material {material_id!r} needs executable AO/reference-PBR locality or an explicit intentional-smooth rule"
+            )
+
+    lookdev = spec.get("lookDevTargets")
+    quality_first = isinstance(lookdev, dict) and lookdev.get("qualityPriority") == "reference-fidelity"
+    if quality_first and has_non_empty(spec.get("sourceImage")):
         for material in materials:
             if material.get("qualityTier") == "utility":
                 continue
-            gaps.extend(quality_first_material_gaps(spec, material))
+            reference = material.get("referencePbr")
+            maps = reference.get("maps") if isinstance(reference, dict) else None
+            has_browser_urls = isinstance(maps, dict) and all(
+                isinstance(maps.get(channel), dict)
+                and has_non_empty(maps[channel].get("url"))
+                for channel in ("albedo", "roughness", "height", "normal", "ao")
+            )
+            if (
+                not isinstance(reference, dict)
+                or reference.get("usable") is not True
+                or reference.get("materialCropConfirmed") is not True
+                or not has_browser_urls
+            ):
+                material_id = str(material.get("id") or "(unnamed)")
+                gaps.append(
+                    f"material {material_id!r} needs confirmed material-crop PBR maps with browser URLs, or use balanced quality"
+                )
+    for component in spec.get("componentTree", []):
+        if not isinstance(component, dict):
+            continue
+        primitive = component.get("primitive")
+        expected = SPECIAL_PRIMITIVE_PROFILES.get(primitive)
+        if expected is None:
+            continue
+        material_id = component.get("material")
+        material = materials_by_id.get(material_id)
+        if not isinstance(material, dict):
+            continue
+        actual = material.get("materialProfile", "standard")
+        if actual != expected:
+            component_id = str(component.get("id") or "(unnamed)")
+            gaps.append(
+                f"material {material_id!r} used by {primitive} component {component_id!r} "
+                f"needs materialProfile {expected!r}"
+            )
     return gaps
 
 
-def surface_pass_gaps(spec: dict[str, Any]) -> list[str]:
-    components = [item for item in spec.get("componentTree", []) if isinstance(item, dict)]
-    has_surface_detail = any(has_non_empty(item.get("surfaceDetail")) for item in components)
-    if not has_surface_detail:
-        return ["componentTree has no meaningful surfaceDetail for normal/bump/displacement/AO locality"]
+def surface_gaps(spec: dict[str, Any]) -> list[str]:
+    components = [
+        item
+        for item in spec.get("componentTree", [])
+        if isinstance(item, dict) and component_type(item) != "assembly"
+    ]
+    gaps: list[str] = []
+    for item in components:
+        importance = item.get("importance", 1.0)
+        if has_number(importance) and float(importance) < 0.75:
+            continue
+        detail = item.get("surfaceDetail")
+        meaningful = isinstance(detail, dict) and any(
+            layer_number(detail.get(field), ("base", "amount", "value")) > 0
+            for field in ("macroRoughness", "microRoughness", "bumpAmplitude")
+        )
+        if meaningful or (isinstance(detail, dict) and _intentional_uniform_surface(detail)):
+            continue
+        component_id = str(item.get("id") or item.get("name") or "(unnamed)")
+        gaps.append(
+            f"important component {component_id!r} needs numeric executable surfaceDetail or an explicit intentionally-smooth rule"
+        )
+    return gaps
+
+
+def lighting_gaps(spec: dict[str, Any]) -> list[str]:
+    lighting = spec.get("lightingFromPhoto", [])
+    if not isinstance(lighting, list):
+        return ["lightingFromPhoto must describe the review lighting"]
+    text = " ".join(str(item).lower() for item in lighting)
+    groups = {
+        "key light": ("key", "main light", "sun"),
+        "fill or environment light": ("fill", "ambient", "environment", "hdr", "hemisphere"),
+        "tone/exposure": ("tone", "exposure", "aces", "filmic"),
+        "contact shadow": ("contact shadow", "ground shadow", "ambient occlusion", "ao"),
+    }
+    return [f"lightingFromPhoto is missing {label}" for label, words in groups.items() if not any(word in text for word in words)]
+
+
+def interaction_gaps(spec: dict[str, Any]) -> list[str]:
+    readiness = spec.get("actionReadiness")
+    if not isinstance(readiness, dict) or readiness.get("enabled") is not True:
+        return ["actionReadiness.enabled must be true for an interaction pass"]
+    components = [
+        item
+        for item in spec.get("componentTree", [])
+        if isinstance(item, dict) and component_type(item) != "assembly"
+    ]
+    missing = [
+        str(item.get("id") or "(unnamed)")
+        for item in components
+        if item.get("level") in {"macro", "meso"}
+        and not isinstance(item.get("actionProfile"), dict)
+    ]
+    if missing:
+        return ["macro/meso components missing actionProfile: " + ", ".join(missing)]
     return []
 
 
-def lighting_pass_gaps(spec: dict[str, Any]) -> list[str]:
-    lighting = spec.get("lightingFromPhoto", [])
-    if not isinstance(lighting, list) or len([item for item in lighting if has_non_empty(item)]) < 3:
-        return ["lightingFromPhoto needs at least three concrete entries for key/fill/rim or environment lighting"]
-    text = " ".join(str(item).lower() for item in lighting)
-    required_groups = {
-        "key light": ("key", "sun", "main light"),
-        "fill light": ("fill", "ambient", "hemisphere"),
-        "rim/environment light": ("rim", "back light", "environment", "hdr", "reflection"),
-        "exposure/tone mapping": ("exposure", "tone", "aces", "filmic"),
-        "contact shadow": ("contact shadow", "ground shadow", "ambient occlusion", "ao"),
-    }
-    gaps = [
-        f"lightingFromPhoto missing {label}"
-        for label, terms in required_groups.items()
-        if not any(term in text for term in terms)
-    ]
+def pre_spec_gaps(spec: dict[str, Any]) -> list[str]:
+    assessment = spec.get("preSpecAssessment")
+    if not isinstance(assessment, dict):
+        return ["preSpecAssessment is required before blockout"]
+    object_class = assessment.get("objectClass")
+    gaps: list[str] = []
+    if not isinstance(object_class, dict):
+        gaps.append("preSpecAssessment.objectClass is required")
+    else:
+        if not has_non_empty(object_class.get("primaryType")):
+            gaps.append("identify the primary object type from the reference")
+        for field in ("formLanguage", "structureKind", "materialFamilies"):
+            if not has_non_empty(object_class.get(field)):
+                gaps.append(f"fill preSpecAssessment.objectClass.{field} from visual inspection")
+    silhouette = spec.get("silhouette")
+    if not isinstance(silhouette, dict) or not has_non_empty(
+        [silhouette.get("boundingShape"), silhouette.get("aspectRatios"), silhouette.get("dominantCurves")]
+    ):
+        gaps.append("record the observed silhouette shape/proportions before blockout")
     return gaps
 
 
+def spec_depth_gaps(spec: dict[str, Any], include_micro: bool) -> list[str]:
+    contract = spec.get("qualityContract")
+    minimums = contract.get("minimumSpecDepth") if isinstance(contract, dict) else None
+    if not isinstance(minimums, dict):
+        return ["qualityContract.minimumSpecDepth is required"]
+    components = [
+        item
+        for item in spec.get("componentTree", [])
+        if isinstance(item, dict) and component_type(item) != "assembly"
+    ]
+    actual = {
+        "macroComponents": sum(item.get("level") == "macro" for item in components),
+        "mesoComponents": sum(item.get("level") == "meso" for item in components),
+        "microFeatureGroups": sum(
+            len(item.get("localFeatures", []))
+            for item in components
+            if isinstance(item.get("localFeatures"), list)
+        ),
+    }
+    fields = ("macroComponents", "mesoComponents")
+    if include_micro:
+        fields += ("microFeatureGroups",)
+    return [
+        f"{field} is below the selected complexity depth ({actual[field]} < {minimums[field]})"
+        for field in fields
+        if isinstance(minimums.get(field), int) and actual[field] < minimums[field]
+    ]
+
+
 def pass_specific_evidence(pass_id: str) -> list[str]:
-    if pass_id in {"structural-pass", "form-refinement"}:
-        return [
-            "attachment contracts for child appendages/connectors",
-            "no floating child roots/joints in the browser screenshot",
-        ]
-    if pass_id == "material-pass":
-        return [
-            "reference-derived albedo palette with dominant, secondary, and accent colors",
-            "independent albedo, roughness, height/normal, and AO maps",
-            "macro, meso, and micro surface-frequency response at 1024px or higher",
-            "local material masks: AO, dirt, wear, stains, moss, chips, scratches, wetness, or equivalent",
-            "neutral, grazing-light close-up, and reference-matched browser screenshots",
-            "AI vision comparison sheet score meeting the visual acceptance threshold",
-        ]
-    if pass_id == "surface-pass":
-        return [
-            "component surfaceDetail for tactile normal/bump/displacement and locality",
-        ]
-    if pass_id == "lighting-pass":
-        return [
-            "lightingFromPhoto with key/fill/rim or environment light",
-            "exposure, tone mapping, background, shadow softness, and contact shadow behavior",
-        ]
+    if pass_id in {"structure", "form", "structural-pass", "form-refinement"}:
+        return ["child joints have explicit attachment contracts and no visible floating roots"]
+    if pass_id in {"lookdev", "material-pass", "surface-pass", "lighting-pass"}:
+        return ["palette, material response, local detail, lighting, and contact shadow are reviewable"]
+    if pass_id in {"interaction", "interaction-pass"}:
+        return ["runtime checks cover load, transforms, and the requested interaction"]
+    if pass_id in {"optimization", "optimization-pass"}:
+        return ["measured FPS, draw calls, triangles, device, and performance capture"]
     return []
 
 
 def pass_specific_gaps(spec: dict[str, Any], pass_id: str) -> list[str]:
-    if pass_id in {"structural-pass", "form-refinement"}:
-        return attachment_gaps(spec)
-    if pass_id == "material-pass":
-        return material_pass_gaps(spec)
-    if pass_id == "surface-pass":
-        return surface_pass_gaps(spec)
-    if pass_id == "lighting-pass":
-        return lighting_pass_gaps(spec)
-    return []
+    gaps: list[str] = []
+    if pass_id == "blockout":
+        gaps.extend(pre_spec_gaps(spec))
+    if pass_id in {"structure", "form", "structural-pass", "form-refinement"}:
+        gaps.extend(attachment_gaps(spec))
+        gaps.extend(
+            spec_depth_gaps(
+                spec,
+                include_micro=pass_id in {"form", "form-refinement"},
+            )
+        )
+    if pass_id in {"lookdev", "material-pass"}:
+        gaps.extend(material_gaps(spec))
+    if pass_id in {"lookdev", "surface-pass"}:
+        gaps.extend(surface_gaps(spec))
+    if pass_id in {"lookdev", "lighting-pass"}:
+        gaps.extend(lighting_gaps(spec))
+    if pass_id in {"interaction", "interaction-pass"}:
+        gaps.extend(interaction_gaps(spec))
+    return list(dict.fromkeys(gaps))
 
 
-def sync_pipeline(spec: dict[str, Any]) -> dict[str, Any]:
-    ids = pass_order(spec)
-    completed = completed_passes(spec, ids)
-    current = current_pass(ids, completed)
-    pipeline = spec.setdefault("sculptPipeline", {})
-    if not isinstance(pipeline, dict):
-        pipeline = {}
-        spec["sculptPipeline"] = pipeline
-    pipeline.update(
-        {
-            "passGateMode": "locked-sequential",
-            "passOrder": ids,
-            "currentPass": current,
-            "completedPasses": completed,
-            "lastCompletedPass": completed[-1] if completed else "",
-            "blockedReason": "" if current != "complete" else "all build passes completed",
-            "nextRequiredEvidence": next_required_evidence(spec, current),
-        }
-    )
-    return pipeline
+def check_pass(
+    spec: dict[str, Any],
+    requested_pass: str,
+    *,
+    _geometry_prevalidated: bool = False,
+) -> tuple[bool, str, dict[str, Any]]:
+    allowed, message, status = contract_check_pass(spec, requested_pass)
+    if not allowed:
+        return allowed, message, status
+    if not _geometry_prevalidated:
+        capability_errors = geometry_capability_report(spec)["errors"]
+        if capability_errors:
+            return (
+                False,
+                f"pass {requested_pass!r} has unsupported geometry: {'; '.join(capability_errors)}",
+                status,
+            )
+    gaps = pass_specific_gaps(spec, requested_pass)
+    if gaps:
+        return False, f"pass {requested_pass!r} needs spec refinement: {'; '.join(gaps)}", status
+    return True, message, status
 
 
-def check_pass(spec: dict[str, Any], requested_pass: str) -> tuple[bool, str, dict[str, Any]]:
-    pipeline = sync_pipeline(spec)
-    ids = list(pipeline["passOrder"])
-    if requested_pass not in ids:
-        return False, f"unknown build pass {requested_pass!r}", pipeline
-    current = str(pipeline["currentPass"])
-    completed = list(pipeline.get("completedPasses", []))
-    if requested_pass in completed or current == "complete":
-        gaps = pass_specific_gaps(spec, requested_pass)
-        if gaps:
-            return False, f"pass {requested_pass!r} needs spec refinement: {'; '.join(gaps)}", pipeline
-        return True, f"pass {requested_pass!r} is already completed and can be regenerated", pipeline
-    if requested_pass == current:
-        gaps = pass_specific_gaps(spec, requested_pass)
-        if gaps:
-            return False, f"pass {requested_pass!r} needs spec refinement: {'; '.join(gaps)}", pipeline
-        return True, f"pass {requested_pass!r} is the current unlocked pass", pipeline
-    previous_index = ids.index(requested_pass) - 1
-    previous = ids[previous_index] if previous_index >= 0 else ""
-    return (
-        False,
-        f"pass {requested_pass!r} is locked; complete {previous!r} with reviewHistory.action=continue and screenshot evidence first",
-        pipeline,
-    )
+def geometry_capability_report(spec: dict[str, Any]) -> dict[str, Any]:
+    """Summarize whether the declared hierarchy has real registered emitters."""
+    components = [item for item in spec.get("componentTree", []) if isinstance(item, dict)]
+    component_lookup = {
+        str(item["id"]): item
+        for item in components
+        if isinstance(item.get("id"), str) and item["id"].strip()
+    }
+    repetition_systems = spec.get("repetitionSystems", [])
+    errors = validate_repetition_systems(repetition_systems)
+    for component in components:
+        errors.extend(
+            validate_geometry_component(
+                component,
+                repetition_systems,
+                component_lookup,
+            )
+        )
+    errors = list(dict.fromkeys(errors))
+    return {
+        "canGenerate": not errors,
+        "parts": sum(component_type(item) == "part" for item in components),
+        "assemblies": sum(component_type(item) == "assembly" for item in components),
+        "repetitionSystems": len(repetition_systems) if isinstance(repetition_systems, list) else 0,
+        "supportedPrimitives": sorted(VALID_PRIMITIVES),
+        "errors": errors,
+    }
 
 
 def status_payload(spec: dict[str, Any]) -> dict[str, Any]:
-    pipeline = sync_pipeline(spec)
+    status = pipeline_status(spec)
+    capabilities = geometry_capability_report(spec)
+    current_gaps = (
+        []
+        if status["currentPass"] == "complete"
+        else pass_specific_gaps(spec, str(status["currentPass"]))
+    )
+    current_gaps.extend(f"geometry: {error}" for error in capabilities["errors"])
     return {
         "targetName": spec.get("targetName"),
-        "passGateMode": pipeline.get("passGateMode"),
-        "currentPass": pipeline.get("currentPass"),
-        "completedPasses": pipeline.get("completedPasses", []),
-        "nextRequiredEvidence": pipeline.get("nextRequiredEvidence", []),
+        **status,
+        "geometryCapabilities": capabilities,
+        "currentPassGaps": list(dict.fromkeys(current_gaps)),
     }
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    status_parser = subparsers.add_parser("status", help="Print current sculpt pipeline state")
-    status_parser.add_argument("spec", type=Path)
-    status_parser.add_argument("--json", action="store_true")
-
-    check_parser = subparsers.add_parser("check", help="Fail unless a build pass is unlocked")
-    check_parser.add_argument("spec", type=Path)
-    check_parser.add_argument("--pass-id", required=True)
-    check_parser.add_argument("--json", action="store_true")
-
-    sync_parser = subparsers.add_parser("sync", help="Refresh sculptPipeline from reviewHistory")
-    sync_parser.add_argument("spec", type=Path)
-    sync_parser.add_argument("--in-place", action="store_true")
-    sync_parser.add_argument("--out", type=Path)
-    sync_parser.add_argument("--json", action="store_true")
-
+    for command in ("status", "sync"):
+        child = subparsers.add_parser(command)
+        child.add_argument("spec", type=Path)
+    check = subparsers.add_parser("check")
+    check.add_argument("spec", type=Path)
+    check.add_argument("--pass-id", required=True)
     args = parser.parse_args(argv)
-    spec_path = args.spec.expanduser().resolve()
-    spec = load_spec(spec_path)
+    path = args.spec.expanduser().resolve()
+    try:
+        from sculpt_modules import (
+            is_module_manifest,
+            load_document,
+            module_status,
+            read_raw_spec,
+            save_document,
+        )
 
-    if args.command == "status":
-        payload = status_payload(spec)
-        if args.json:
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
-        else:
-            print(f"currentPass: {payload['currentPass']}")
-            print(f"completedPasses: {', '.join(payload['completedPasses']) or '(none)'}")
-            for item in payload["nextRequiredEvidence"]:
-                print(f"required: {item}")
-        return 0
-
-    if args.command == "check":
-        ok, message, pipeline = check_pass(spec, args.pass_id)
-        payload = {"ok": ok, "message": message, "pipeline": pipeline}
-        if args.json:
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
-        else:
-            print("PASS" if ok else "FAIL")
-            print(message)
-        return 0 if ok else 1
-
-    if args.command == "sync":
-        payload = status_payload(spec)
-        output = spec_path if args.in_place else (args.out.expanduser().resolve() if args.out else None)
-        if output:
-            write_spec(output, spec)
-        if args.json:
-            print(json.dumps(payload, indent=2, ensure_ascii=False))
-        else:
-            print(output or json.dumps(spec, indent=2, ensure_ascii=False))
-        return 0
-
-    parser.error("unreachable command")
-    return 2
+        raw_spec = read_raw_spec(path)
+        if is_module_manifest(raw_spec):
+            modular_status = module_status(path, raw_spec)
+            if args.command in {"status", "sync"}:
+                if modular_status["assemblyReady"]:
+                    document = load_document(path, allow_missing=False)
+                    if args.command == "sync":
+                        sync_pipeline(document.resolved)
+                        save_document(document)
+                    modular_status["passWorkflow"] = status_payload(document.resolved)
+                print(json.dumps(modular_status, indent=2, ensure_ascii=False))
+                return 0 if not modular_status["errors"] else 1
+            if not modular_status["assemblyReady"]:
+                print(
+                    json.dumps(
+                        {
+                            "allowed": False,
+                            "message": (
+                                "pass workflow is locked until every required module is accepted; "
+                                f"current module is {modular_status.get('currentModule')!r}"
+                            ),
+                            **modular_status,
+                        },
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                )
+                return 1
+        spec = load_spec_file(path)
+        if args.command == "status":
+            print(json.dumps(status_payload(spec), indent=2, ensure_ascii=False))
+            return 0
+        if args.command == "sync":
+            sync_pipeline(spec)
+            write_spec_atomic(path, spec)
+            print(json.dumps(status_payload(spec), indent=2, ensure_ascii=False))
+            return 0
+        allowed, message, status = check_pass(spec, args.pass_id)
+        print(json.dumps({"allowed": allowed, "message": message, **status}, indent=2, ensure_ascii=False))
+        return 0 if allowed else 1
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

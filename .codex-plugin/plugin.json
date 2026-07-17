@@ -1,6 +1,6 @@
 {
   "name": "threejs-object-sculptor",
-  "version": "0.1.1+codex.20260709134833",
+  "version": "0.3.0+codex.20260717164530",
   "description": "Turn object reference images into quality-gated, action-ready procedural Three.js reconstruction plans and code.",
   "author": {
     "name": "Vinh Hien"

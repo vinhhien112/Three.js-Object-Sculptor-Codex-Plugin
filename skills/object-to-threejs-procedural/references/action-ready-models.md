@@ -1,6 +1,6 @@
 # Action-Ready Procedural Models
 
-Use this reference when a procedural Three.js model may later need animation, transformation, physics, or destruction.
+Use this reference only when intended use activates the `interaction` pass: animation, playable behavior, physics, or destruction. A static prop needs a stable root, but it does not need invented sockets, colliders, and fracture metadata.
 
 ## Design Goal
 
@@ -43,7 +43,7 @@ Use this structure:
 
 ## Acceptance Criteria
 
-An action-ready model passes when:
+An active interaction pass succeeds when:
 
 - Every major part has a stable ID and pivot node.
 - Movable or breakable parts are not merged into unrelated geometry.

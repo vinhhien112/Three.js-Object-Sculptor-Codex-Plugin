@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a pre-spec assessment and quality contract skeleton before ObjectSculptSpec authoring."""
+"""Legacy compatibility wrapper for the pre-spec section now created by `sculpt init`."""
 
 from __future__ import annotations
 
@@ -8,95 +8,76 @@ import json
 import sys
 from pathlib import Path
 
-from new_sculpt_spec import make_pre_spec_assessment, make_quality_contract
+from new_sculpt_spec import make_spec
 
 
-COMPLEXITY_MINIMUMS = {
-    "simple": {
-        "macroComponents": 1,
-        "mesoComponents": 0,
-        "microFeatureGroups": 0,
-        "materialLayers": 1,
-        "repetitionSystems": 0,
-        "reviewViewpoints": 2,
-    },
-    "moderate": {
-        "macroComponents": 2,
-        "mesoComponents": 3,
-        "microFeatureGroups": 2,
-        "materialLayers": 2,
-        "repetitionSystems": 0,
-        "reviewViewpoints": 3,
-    },
-    "complex": {
-        "macroComponents": 3,
-        "mesoComponents": 8,
-        "microFeatureGroups": 5,
-        "materialLayers": 3,
-        "repetitionSystems": 1,
-        "reviewViewpoints": 4,
-    },
-    "ultra-complex": {
-        "macroComponents": 5,
-        "mesoComponents": 16,
-        "microFeatureGroups": 8,
-        "materialLayers": 4,
-        "repetitionSystems": 2,
-        "reviewViewpoints": 5,
-    },
-}
-
-
-def make_payload(target_name: str, image: str | None, complexity: str) -> dict:
-    assessment = make_pre_spec_assessment(target_name)
-    contract = make_quality_contract()
-    assessment["sourceImage"] = image or ""
-    assessment["complexity"]["tier"] = complexity
-    assessment["specDepthDecision"]["requiredDepth"] = complexity
-    if complexity in {"complex", "ultra-complex"}:
-        assessment["specDepthDecision"]["needsRepetitionSystems"] = True
-        assessment["specDepthDecision"]["needsMaterialLocalOverrides"] = True
-        assessment["specDepthDecision"]["minimumComponentLevels"] = ["macro", "meso", "micro"]
-    elif complexity == "moderate":
-        assessment["specDepthDecision"]["minimumComponentLevels"] = ["macro", "meso"]
-    contract["qualityBar"] = complexity
-    contract["minimumSpecDepth"] = COMPLEXITY_MINIMUMS[complexity]
+def make_payload(
+    target_name: str,
+    image: str | None,
+    complexity: str,
+    intended_use: str = "browser-prop",
+    quality_profile: str = "balanced",
+) -> dict:
+    spec = make_spec(
+        target_name,
+        image,
+        complexity=complexity,
+        intended_use=intended_use,
+        quality_profile=quality_profile,
+    )
     return {
         "targetName": target_name,
-        "sourceImage": image or "",
-        "preSpecAssessment": assessment,
-        "qualityContract": contract,
+        "sourceImage": spec["sourceImage"],
+        "preSpecAssessment": spec["preSpecAssessment"],
+        "surfaceTopologyPlan": spec["surfaceTopologyPlan"],
+        "qualityContract": spec["qualityContract"],
+        "buildPasses": spec["buildPasses"],
         "authoringInstruction": (
-            "Fill observed object class, complexity reasoning, featureGroups, visualDeltaChecks, "
-            "and unknowns before generating or implementing ObjectSculptSpec."
+            "This compatibility output is optional. Prefer `python3 scripts/sculpt.py init`, "
+            "which keeps pre-spec and the final spec in one file."
         ),
     }
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("target_name", help="Human-readable object name")
-    parser.add_argument("--image", help="Reference image path or URL")
+    parser.add_argument("target_name")
+    parser.add_argument("--image")
     parser.add_argument(
         "--complexity",
-        choices=sorted(COMPLEXITY_MINIMUMS),
+        choices=("simple", "moderate", "complex", "ultra", "ultra-complex"),
         default="moderate",
-        help="Initial complexity estimate. Refine after visual inspection.",
     )
-    parser.add_argument("--out", type=Path, help="Output JSON path")
-    parser.add_argument("--force", action="store_true", help="Overwrite output file")
+    parser.add_argument(
+        "--intended-use",
+        choices=("static-render", "browser-prop", "game-prop", "animated", "playable", "destructible"),
+        default="browser-prop",
+    )
+    parser.add_argument(
+        "--quality-profile",
+        choices=("balanced", "reference-fidelity"),
+        default="balanced",
+    )
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
-
-    payload = json.dumps(make_payload(args.target_name, args.image, args.complexity), indent=2, ensure_ascii=False) + "\n"
-    if args.out:
-        output = args.out.expanduser().resolve()
-        if output.exists() and not args.force:
-            parser.error(f"{output} already exists; use --force to overwrite")
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(payload, encoding="utf-8")
-        print(output)
-    else:
-        print(payload, end="")
+    payload = make_payload(
+        args.target_name,
+        args.image,
+        "ultra" if args.complexity == "ultra-complex" else args.complexity,
+        args.intended_use,
+        args.quality_profile,
+    )
+    text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+    if not args.out:
+        print(text, end="")
+        return 0
+    output = args.out.expanduser().resolve()
+    if output.exists() and not args.force:
+        parser.error(f"{output} already exists; use --force to overwrite")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(text, encoding="utf-8")
+    print(output)
     return 0
 
 

@@ -4,9 +4,9 @@
 This is not photogrammetry and it does not claim exact inverse rendering from a
 single image. It extracts pixel evidence that is useful for procedural PBR:
 albedo palette, de-lit albedo, roughness estimate, height, normal, and AO maps.
-If the estimated confidence is below the requested target, the script exits
-non-zero and refuses to patch the sculpt spec unless --allow-low-confidence is
-passed.
+An unconfirmed crop never patches a spec. Low extraction suitability also blocks
+patching unless ``--allow-low-confidence`` is explicit. The legacy ``confidence``
+field is retained for schema compatibility.
 """
 
 from __future__ import annotations
@@ -14,18 +14,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import shutil
-import struct
-import subprocess
 import sys
-import tempfile
-import zlib
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-
-PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+from sculpt_contract import write_spec_atomic
+from sculpt_image_io import (
+    load_image_rgba_limited as load_image,
+    png_dimensions,
+    write_png_rgb,
+)
+from sculpt_modules import load_document, save_document
 
 
 def slugify(value: str) -> str:
@@ -79,132 +79,6 @@ def median_color(samples: list[tuple[int, int, int]]) -> tuple[int, int, int]:
         int(percentile([float(sample[channel]) for sample in samples], 0.5))
         for channel in range(3)
     )  # type: ignore[return-value]
-
-
-def read_png(path: Path) -> tuple[int, int, list[tuple[int, int, int, int]]]:
-    data = path.read_bytes()
-    if not data.startswith(PNG_SIGNATURE):
-        raise ValueError("not a PNG file")
-    cursor = len(PNG_SIGNATURE)
-    width = height = bit_depth = color_type = None
-    idat = bytearray()
-    interlace = 0
-    while cursor + 8 <= len(data):
-        length = struct.unpack(">I", data[cursor : cursor + 4])[0]
-        chunk_type = data[cursor + 4 : cursor + 8]
-        chunk_data = data[cursor + 8 : cursor + 8 + length]
-        cursor += 12 + length
-        if chunk_type == b"IHDR":
-            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", chunk_data)
-        elif chunk_type == b"IDAT":
-            idat.extend(chunk_data)
-        elif chunk_type == b"IEND":
-            break
-    if width is None or height is None or bit_depth != 8 or interlace != 0:
-        raise ValueError("unsupported PNG; expected 8-bit non-interlaced image")
-    channels_by_type = {0: 1, 2: 3, 4: 2, 6: 4}
-    if color_type not in channels_by_type:
-        raise ValueError("unsupported PNG color type; convert to RGB/RGBA first")
-    channels = channels_by_type[color_type]
-    row_bytes = width * channels
-    raw = zlib.decompress(bytes(idat))
-    rows: list[bytearray] = []
-    offset = 0
-    previous = bytearray(row_bytes)
-    for _ in range(height):
-        filter_type = raw[offset]
-        offset += 1
-        row = bytearray(raw[offset : offset + row_bytes])
-        offset += row_bytes
-        for index in range(row_bytes):
-            left = row[index - channels] if index >= channels else 0
-            up = previous[index]
-            up_left = previous[index - channels] if index >= channels else 0
-            if filter_type == 1:
-                row[index] = (row[index] + left) & 0xFF
-            elif filter_type == 2:
-                row[index] = (row[index] + up) & 0xFF
-            elif filter_type == 3:
-                row[index] = (row[index] + ((left + up) // 2)) & 0xFF
-            elif filter_type == 4:
-                predictor = paeth_predictor(left, up, up_left)
-                row[index] = (row[index] + predictor) & 0xFF
-            elif filter_type != 0:
-                raise ValueError(f"unsupported PNG filter {filter_type}")
-        rows.append(row)
-        previous = row
-    pixels: list[tuple[int, int, int, int]] = []
-    for row in rows:
-        for x in range(width):
-            base = x * channels
-            if color_type == 0:
-                gray = row[base]
-                pixels.append((gray, gray, gray, 255))
-            elif color_type == 2:
-                pixels.append((row[base], row[base + 1], row[base + 2], 255))
-            elif color_type == 4:
-                gray = row[base]
-                pixels.append((gray, gray, gray, row[base + 1]))
-            elif color_type == 6:
-                pixels.append((row[base], row[base + 1], row[base + 2], row[base + 3]))
-    return width, height, pixels
-
-
-def paeth_predictor(a: int, b: int, c: int) -> int:
-    p = a + b - c
-    pa = abs(p - a)
-    pb = abs(p - b)
-    pc = abs(p - c)
-    if pa <= pb and pa <= pc:
-        return a
-    if pb <= pc:
-        return b
-    return c
-
-
-def write_png_rgb(path: Path, width: int, height: int, rgb: bytes) -> None:
-    if len(rgb) != width * height * 3:
-        raise ValueError("RGB payload has the wrong size")
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    def chunk(kind: bytes, payload: bytes) -> bytes:
-        checksum = zlib.crc32(kind)
-        checksum = zlib.crc32(payload, checksum) & 0xFFFFFFFF
-        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
-
-    scanlines = bytearray()
-    stride = width * 3
-    for y in range(height):
-        scanlines.append(0)
-        scanlines.extend(rgb[y * stride : (y + 1) * stride])
-    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
-    path.write_bytes(
-        PNG_SIGNATURE
-        + chunk(b"IHDR", ihdr)
-        + chunk(b"IDAT", zlib.compress(bytes(scanlines), level=6))
-        + chunk(b"IEND", b"")
-    )
-
-
-def load_image(path: Path) -> tuple[int, int, list[tuple[int, int, int, int]], list[str]]:
-    warnings: list[str] = []
-    try:
-        return (*read_png(path), warnings)
-    except Exception as direct_error:
-        sips = shutil.which("sips")
-        if not sips:
-            raise ValueError(
-                f"could not decode {path.name} as PNG and macOS sips is unavailable: {direct_error}"
-            ) from direct_error
-        with tempfile.TemporaryDirectory() as tmpdir:
-            converted = Path(tmpdir) / "converted.png"
-            command = [sips, "-s", "format", "png", str(path), "--out", str(converted)]
-            result = subprocess.run(command, capture_output=True, text=True, check=False)
-            if result.returncode != 0:
-                raise ValueError(result.stderr.strip() or result.stdout.strip() or "sips conversion failed")
-            warnings.append("source image was converted to PNG with macOS sips before pixel extraction")
-            width, height, pixels = read_png(converted)
-            return width, height, pixels, warnings
 
 
 def sample_corner_background(
@@ -397,6 +271,32 @@ def blur_scalar(values: list[float], size: int, radius: int) -> list[float]:
     return vertical
 
 
+def make_tileable_rgb(payload: bytes, size: int, blend_fraction: float = 0.08) -> bytes:
+    """Blend opposite border pairs so repeated offline maps do not expose hard seams."""
+    if len(payload) != size * size * 3:
+        raise ValueError("tileable RGB payload has the wrong size")
+    output = bytearray(payload)
+    blend = max(1, min(size // 4, round(size * blend_fraction)))
+
+    def blend_pair(first: int, second: int, weight: float) -> None:
+        for channel in range(3):
+            average = (output[first + channel] + output[second + channel]) * 0.5
+            output[first + channel] = round(output[first + channel] * (1 - weight) + average * weight)
+            output[second + channel] = round(output[second + channel] * (1 - weight) + average * weight)
+
+    for offset in range(blend):
+        weight = 1 - offset / blend
+        for y in range(size):
+            left = (y * size + offset) * 3
+            right = (y * size + size - 1 - offset) * 3
+            blend_pair(left, right, weight)
+        for x in range(size):
+            top = (offset * size + x) * 3
+            bottom = ((size - 1 - offset) * size + x) * 3
+            blend_pair(top, bottom, weight)
+    return bytes(output)
+
+
 def make_maps(
     pixels: list[tuple[int, int, int]],
     mask: list[bool],
@@ -407,16 +307,26 @@ def make_maps(
     fallback_luma = percentile(masked_lumas, 0.5, 0.55)
     fallback_color = hex_to_rgb(palette[0] if palette else "#8A7A5F")
     lumas = [srgb_luma(pixel) if keep else fallback_luma for pixel, keep in zip(pixels, mask)]
-    blur_radius = max(4, min(28, size // 48))
-    low_frequency = blur_scalar(lumas, size, blur_radius)
+    broad_radius = max(8, min(64, size // 24))
+    meso_radius = max(2, min(20, size // 128))
+    broad_frequency = blur_scalar(lumas, size, broad_radius)
+    meso_frequency = blur_scalar(lumas, size, meso_radius)
     p05 = percentile(masked_lumas, 0.05, 0.2)
     p95 = percentile(masked_lumas, 0.95, 0.8)
     value_range = max(0.08, p95 - p05)
-    high_pass = [
-        clamp((luma - low + value_range * 0.5) / value_range, 0.0, 1.0)
-        for luma, low in zip(lumas, low_frequency)
+    micro_detail = [
+        clamp((luma - meso + value_range * 0.5) / value_range, 0.0, 1.0)
+        for luma, meso in zip(lumas, meso_frequency)
     ]
-    height = blur_scalar(high_pass, size, max(1, size // 256))
+    meso_detail = [
+        clamp((meso - broad + value_range * 0.5) / value_range, 0.0, 1.0)
+        for meso, broad in zip(meso_frequency, broad_frequency)
+    ]
+    combined_height = [
+        clamp(micro * 0.68 + meso * 0.32, 0.0, 1.0)
+        for micro, meso in zip(micro_detail, meso_detail)
+    ]
+    height = blur_scalar(combined_height, size, max(1, size // 256))
     gradient_values: list[float] = []
     for y in range(size):
         for x in range(size):
@@ -435,7 +345,7 @@ def make_maps(
     roughness_values: list[float] = []
     for index, ((red, green, blue), keep) in enumerate(zip(pixels, mask)):
         luma = lumas[index]
-        shade = clamp(low_frequency[index], 0.08, 1.0)
+        shade = clamp(broad_frequency[index], 0.08, 1.0)
         scale = clamp((fallback_luma / shade) ** 0.42, 0.72, 1.35)
         if keep:
             out_r = clamp(red * scale, 0, 255)
@@ -497,9 +407,34 @@ def make_maps(
             "roughnessBase": round(percentile(roughness_values, 0.5, 0.72), 3),
             "roughnessVariation": round(max(0.05, percentile(roughness_values, 0.85, 0.82) - percentile(roughness_values, 0.15, 0.62)), 3),
             "normalStrength": round(normal_strength / 64.0, 3),
-            "blurRadius": blur_radius,
+            "broadBlurRadius": broad_radius,
+            "mesoBlurRadius": meso_radius,
+            "tileEdgeBlendFraction": 0.08,
         },
     )
+
+
+def explicit_mask_from_image(
+    path: Path,
+    width: int,
+    height: int,
+    working_dimension: int,
+) -> tuple[list[bool], list[str]]:
+    mask_width, mask_height, pixels, warnings = load_image(path, working_dimension)
+    if (mask_width, mask_height) != (width, height):
+        raise ValueError(
+            f"explicit mask dimensions {mask_width}x{mask_height} do not match working image "
+            f"{width}x{height}"
+        )
+    has_transparency = any(alpha < 250 for _, _, _, alpha in pixels)
+    if has_transparency:
+        mask = [alpha >= 128 for _, _, _, alpha in pixels]
+    else:
+        mask = [srgb_luma((red, green, blue)) >= 0.5 for red, green, blue, _ in pixels]
+    coverage = sum(mask) / max(1, len(mask))
+    if coverage <= 0.01 or coverage >= 0.99:
+        warnings.append("explicit material mask coverage is extreme; verify white/opaque=material")
+    return mask, warnings
 
 
 def hex_to_rgb(value: str) -> tuple[int, int, int]:
@@ -581,8 +516,6 @@ def estimate_confidence(
 
 
 def map_url(url_prefix: str, filename: str) -> str:
-    if not url_prefix:
-        return filename
     return url_prefix.rstrip("/") + "/" + filename
 
 
@@ -601,26 +534,29 @@ def material_patch(
     warnings: list[str],
 ) -> dict[str, Any]:
     prefix = slugify(material_id)
-    maps = {
+    maps: dict[str, dict[str, Any]] = {
         channel: {
             "path": str((out_dir / f"{prefix}_{channel}.png").resolve()),
-            "url": map_url(url_prefix, f"{prefix}_{channel}.png"),
             "channel": channel,
             "source": "reference-pixel-extraction",
+            "tileSafe": True,
         }
         for channel in ("albedo", "roughness", "height", "normal", "ao")
     }
+    if url_prefix:
+        for channel, entry in maps.items():
+            entry["url"] = map_url(url_prefix, f"{prefix}_{channel}.png")
     usable = confidence >= threshold
     return {
         "referencePbr": {
             "version": "1.0",
             "sourceImage": str(image.resolve()),
             "extractor": "extract_reference_pbr.py",
-            "method": "single-image pixel evidence with de-lighting estimate; not photogrammetry",
+            "method": "single-image pixel evidence with broad/meso/micro de-lighting and tile-edge blending; not photogrammetry",
             "usable": usable,
             "verdict": verdict,
             "confidence": confidence,
-            "estimatedFidelity": confidence,
+            "extractionSuitability": confidence,
             "targetThreshold": threshold,
             "hardLimit": "A single image cannot uniquely recover true albedo/roughness/normal/AO; maps are reference-derived estimates.",
             "maps": maps,
@@ -677,6 +613,7 @@ def material_patch(
         "shaderNotes": [
             "Reference-derived maps are estimates from image pixels; verify with neutral, grazing, and reference-matched renders.",
             "Do not treat baked image shadows as final albedo; rerun extraction with a tighter material crop if highlights/shadows pollute the maps.",
+            "Offline map borders are blended for repeat safety; inspect for visible repetition at the target texel density.",
         ],
     }
 
@@ -704,6 +641,7 @@ def merge_material_patch(spec: dict[str, Any], material_id: str, patch: dict[str
             {
                 "materialId": material_id,
                 "confidence": patch["referencePbr"]["confidence"],
+                "extractionSuitability": patch["referencePbr"]["extractionSuitability"],
                 "verdict": patch["referencePbr"]["verdict"],
                 "usable": patch["referencePbr"]["usable"],
                 "maps": patch["referencePbr"]["maps"],
@@ -719,19 +657,42 @@ def extract(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     size = max(256, min(2048, size))
     out_dir = args.out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-    width, height, source_pixels, load_warnings = load_image(image)
+    original_dimensions = png_dimensions(image)
+    working_dimension = max(size, 1024) if size < 2048 else 2048
+    width, height, source_pixels, load_warnings = load_image(image, working_dimension)
     mask, mask_diag, mask_warnings = build_foreground_mask(width, height, source_pixels)
+    explicit_mask_path = getattr(args, "mask", None)
+    if explicit_mask_path:
+        resolved_mask = explicit_mask_path.expanduser().resolve()
+        if not resolved_mask.exists():
+            raise ValueError(f"{resolved_mask} does not exist")
+        mask, explicit_warnings = explicit_mask_from_image(
+            resolved_mask,
+            width,
+            height,
+            working_dimension,
+        )
+        mask_warnings.extend(explicit_warnings)
+        mask_diag["source"] = "explicit-mask"
+        mask_diag["path"] = str(resolved_mask)
+        mask_diag["foregroundCoverage"] = round(sum(mask) / max(1, len(mask)), 4)
     bbox = mask_bbox(width, height, mask)
     sampled_pixels, sampled_mask = resample_crop(width, height, source_pixels, mask, bbox, size)
     samples = representative_samples(sampled_pixels, sampled_mask)
     palette = kmeans_palette(samples, max(2, min(6, args.palette_size)))
     maps, map_stats = make_maps(sampled_pixels, sampled_mask, size, palette)
+    maps = {
+        channel: make_tileable_rgb(payload, size)
+        for channel, payload in maps.items()
+    }
     for channel, payload in maps.items():
         write_png_rgb(out_dir / f"{slugify(args.material_id)}_{channel}.png", size, size, payload)
     warnings = load_warnings + mask_warnings
     diagnostics = {
-        "sourceWidth": width,
-        "sourceHeight": height,
+        "sourceWidth": original_dimensions[0] if original_dimensions else width,
+        "sourceHeight": original_dimensions[1] if original_dimensions else height,
+        "workingWidth": width,
+        "workingHeight": height,
         "mapSize": size,
         "cropBBoxPixels": {
             "x": bbox[0],
@@ -744,16 +705,26 @@ def extract(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         "palette": palette,
     }
     confidence, confidence_notes = estimate_confidence(
-        width,
-        height,
+        original_dimensions[0] if original_dimensions else width,
+        original_dimensions[1] if original_dimensions else height,
         mask_diag,
         map_stats,
         warnings,
-        single_image=not args.multi_view_reference,
+        single_image=True,
     )
+    if args.multi_view_reference:
+        confidence_notes.append(
+            "--multi-view-reference is deprecated: one supplied image cannot prove multi-view material evidence"
+        )
+    if not args.material_crop_confirmed:
+        confidence_notes.append(
+            "input was not confirmed as a material crop; maps are diagnostic only and cannot unlock lookdev"
+        )
     warnings.extend(confidence_notes)
     threshold = clamp01(args.target_threshold)
     verdict = "pass" if confidence >= threshold else ("conditional" if confidence >= threshold - 0.12 else "reject")
+    if not args.material_crop_confirmed and verdict == "pass":
+        verdict = "conditional"
     patch = material_patch(
         args.material_id,
         image,
@@ -768,11 +739,16 @@ def extract(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         diagnostics,
         warnings,
     )
+    patch["referencePbr"]["materialCropConfirmed"] = args.material_crop_confirmed
+    patch["referencePbr"]["usable"] = bool(
+        confidence >= threshold and args.material_crop_confirmed
+    )
     report = {
-        "ok": confidence >= threshold,
+        "ok": confidence >= threshold and args.material_crop_confirmed,
+        "usable": patch["referencePbr"]["usable"],
         "verdict": verdict,
         "confidence": confidence,
-        "estimatedFidelity": confidence,
+        "extractionSuitability": confidence,
         "targetThreshold": threshold,
         "materialId": args.material_id,
         "sourceImage": str(image),
@@ -781,7 +757,8 @@ def extract(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
         "maps": patch["referencePbr"]["maps"],
         "diagnostics": diagnostics,
         "warnings": warnings,
-        "limitation": "single-image PBR extraction is an estimate; 70%+ extraction confidence still needs render screenshot review",
+        "materialCropConfirmed": args.material_crop_confirmed,
+        "limitation": "extractionSuitability measures whether these pixels are useful for inferred maps; it is not physical PBR accuracy and still needs render review",
     }
     return report, patch
 
@@ -791,6 +768,11 @@ def main(argv: list[str]) -> int:
     parser.add_argument("image", type=Path)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--material-id", default="base")
+    parser.add_argument(
+        "--mask",
+        type=Path,
+        help="Optional black/white or alpha mask aligned with the material crop; white/opaque pixels are used.",
+    )
     parser.add_argument("--size", type=int, default=1024)
     parser.add_argument("--palette-size", type=int, default=5)
     parser.add_argument("--target-threshold", type=float, default=0.7)
@@ -800,29 +782,47 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--out-spec", type=Path, help="Write patched spec to this path")
     parser.add_argument("--report", type=Path, help="Write extraction report JSON")
     parser.add_argument("--allow-low-confidence", action="store_true", help="Patch/write even when confidence is below threshold")
-    parser.add_argument("--multi-view-reference", action="store_true", help="Raise confidence cap when image belongs to a multi-view reference set")
+    parser.add_argument(
+        "--material-crop-confirmed",
+        action="store_true",
+        help="Confirm that the input is a crop dominated by one material, not a full UI/demo screenshot.",
+    )
+    parser.add_argument(
+        "--multi-view-reference",
+        action="store_true",
+        help="Deprecated compatibility flag; it no longer raises the score from one image.",
+    )
     args = parser.parse_args(argv)
 
     try:
+        if args.spec and not args.in_place and not args.out_spec:
+            raise ValueError("when --spec is used, choose --in-place or --out-spec")
+        if args.in_place and args.out_spec:
+            raise ValueError("choose only one of --in-place or --out-spec")
         report, patch = extract(args)
         if args.report:
-            args.report.expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-            args.report.expanduser().resolve().write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            write_spec_atomic(args.report.expanduser().resolve(), report)
         if args.spec:
+            if not args.material_crop_confirmed:
+                raise ValueError(
+                    "spec patching requires --material-crop-confirmed; crop one material region first"
+                )
+            if not args.url_prefix:
+                raise ValueError(
+                    "spec patching requires --url-prefix so generated browser asset URLs are explicit"
+                )
             if not report["ok"] and not args.allow_low_confidence:
                 raise ValueError(
                     f"PBR extraction confidence {report['confidence']} is below target "
                     f"{report['targetThreshold']}; spec was not patched"
                 )
             spec_path = args.spec.expanduser().resolve()
-            spec = json.loads(spec_path.read_text(encoding="utf-8"))
-            if not isinstance(spec, dict):
-                raise ValueError("spec must be a JSON object")
+            document = load_document(spec_path)
+            spec = document.resolved
             merge_material_patch(spec, args.material_id, patch)
             output = spec_path if args.in_place else (args.out_spec.expanduser().resolve() if args.out_spec else None)
             if output:
-                output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_text(json.dumps(spec, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                save_document(document, output)
         print(json.dumps(report, indent=2, ensure_ascii=False))
         return 0 if report["ok"] or args.allow_low_confidence else 1
     except Exception as exc:

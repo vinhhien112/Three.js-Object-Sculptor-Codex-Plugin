@@ -29,7 +29,7 @@ For endpoint-based parts, place the pivot group at `localStart`, generate the vi
 
 ## Screenshot Review
 
-During `structural-pass` and `form-refinement`, inspect:
+During `structure` (when present) and `form`, inspect:
 
 1. Are child roots visibly touching, overlapping, or embedded into the parent?
 2. Are there floating joints or air gaps at branch roots, handles, limbs, legs, tubes, or connectors?
